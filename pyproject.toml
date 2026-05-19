@@ -38,3 +38,70 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vggt_omega*"]
+
+[dependency-groups]
+dev = [
+    "beartype>=0.22.9",
+    "jaxtyping>=0.3.7",
+    "pytest>=9.0.3",
+    "radon>=6.0.1",
+    "ruff>=0.15.13",
+    "ty>=0.0.37",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [".venv", "build", "dist", "checkpoints", "demo_outputs", "outputs"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+    "RUF",  # ruff-specific
+    "F722", # forward-annotation (jaxtyping needs this off — set per-file below)
+]
+ignore = [
+    "E501",   # handled by formatter
+    "B006",   # mutable default args — flagged in upstream-derived model code
+    "B008",   # function calls in arg defaults — common in nn.Module factories
+    "B905",   # zip(..., strict=) — upstream PyTorch code predates it
+    "SIM108", # ternary not always clearer
+    "SIM110", # `any(...)` rewrite not always clearer in nn loops
+    "RUF005", # tuple concat — touches model shape code, keep upstream-friendly
+    "RUF013", # implicit Optional via `=None` is widespread in upstream
+    "RUF046", # explicit int() casts are fine
+    "UP007",  # keep Optional[X] readable
+    "UP045",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# jaxtyping annotations look like strings to ruff
+"vggt_omega/**/*.py" = ["F722", "F821"]
+"tests/**/*.py" = ["F722", "F821"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vggt_omega"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "gpu: requires CUDA",
+    "slow: long-running",
+]
+
+[tool.ty.rules]
+# ty is preview-stage; relax a few rules that fire on optional torch imports.
+possibly-unbound-attribute = "ignore"
+unresolved-import = "warn"
+
+[tool.ty.src]
+exclude = [".venv", "build", "dist", "checkpoints", "examples", "demo_outputs", "outputs"]
+

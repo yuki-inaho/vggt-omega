@@ -10,7 +10,6 @@ import torch.nn as nn
 from vggt_omega.models.layers import Mlp, RopePositionEmbedding, SelfAttentionBlock
 from vggt_omega.models.layers.vision_transformer import DinoVisionTransformer
 
-
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 

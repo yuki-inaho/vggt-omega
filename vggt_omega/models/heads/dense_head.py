@@ -7,7 +7,6 @@
 # Inspired by https://github.com/DepthAnything/Depth-Anything-V2
 
 import math
-from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -260,7 +259,9 @@ class FeatureFusionBlock(nn.Module):
             self.resConfUnit1 = ResidualConvUnit(features, activation)
         self.resConfUnit2 = ResidualConvUnit(features, activation)
 
-    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None, size: Tuple[int, int] | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None, size: tuple[int, int] | None = None
+    ) -> torch.Tensor:
         output = x
         if self.has_residual:
             if residual is None:
@@ -274,7 +275,7 @@ class FeatureFusionBlock(nn.Module):
 
 def custom_interpolate(
     x: torch.Tensor,
-    size: Tuple[int, int] | None = None,
+    size: tuple[int, int] | None = None,
     scale_factor: float | None = None,
     mode: str = "bilinear",
     align_corners: bool = True,

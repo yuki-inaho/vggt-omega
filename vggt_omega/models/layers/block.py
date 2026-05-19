@@ -9,7 +9,8 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
-from typing import Callable, List, Optional
+from collections.abc import Callable
+from typing import Optional
 
 import torch
 from torch import Tensor, nn
@@ -18,6 +19,7 @@ from .attention import CausalSelfAttention, SelfAttention
 from .ffn_layers import Mlp
 from .layer_scale import LayerScale  # , DropPath
 from .utils import cat_keep_shapes, uncat_with_shapes
+
 
 class SelfAttentionBlock(nn.Module):
     def __init__(
@@ -128,7 +130,7 @@ class SelfAttentionBlock(nn.Module):
 
         return x_ffn
 
-    def _forward_list(self, x_list: List[Tensor], rope_list=None) -> List[Tensor]:
+    def _forward_list(self, x_list: list[Tensor], rope_list=None) -> list[Tensor]:
         """
         This list operator concatenates the tokens from the list of inputs together to save
         on the elementwise operations. Torch-compile memory-planning allows hiding the overhead
@@ -202,7 +204,7 @@ class SelfAttentionBlock(nn.Module):
 
         return x_ffn
 
-    def forward(self, x_or_x_list, rope_or_rope_list=None) -> List[Tensor]:
+    def forward(self, x_or_x_list, rope_or_rope_list=None) -> list[Tensor]:
         if isinstance(x_or_x_list, Tensor):
             # for reference:
             # return self._forward(x_or_x_list, rope=rope_or_rope_list)

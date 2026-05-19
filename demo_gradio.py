@@ -16,10 +16,10 @@ import gradio as gr
 import numpy as np
 import torch
 
-from visual_util import predictions_to_glb
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
+from visual_util import predictions_to_glb
 
 
 def load_model(checkpoint_path: str) -> VGGTOmega:
@@ -411,8 +411,15 @@ def build_ui(model: VGGTOmega, image_resolution: int):
                 with gr.Row():
                     submit_btn = gr.Button("Reconstruct", scale=1, variant="primary")
                     update_visual_btn = gr.Button("Update Visual", scale=1)
-                    clear_btn = gr.ClearButton(
-                        [input_video, input_images, reconstruction_output, log_output, target_dir_output, image_gallery],
+                    gr.ClearButton(
+                        [
+                            input_video,
+                            input_images,
+                            reconstruction_output,
+                            log_output,
+                            target_dir_output,
+                            image_gallery,
+                        ],
                         scale=1,
                     )
 
