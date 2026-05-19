@@ -6,13 +6,11 @@
 
 from __future__ import annotations
 
-from typing import TypeVar
-
 import numpy as np
 import torch
 from jaxtyping import Float
 
-ArrayOrTensor = TypeVar("ArrayOrTensor", np.ndarray, torch.Tensor)
+ArrayOrTensor = np.ndarray | torch.Tensor
 
 
 def closed_form_inverse_se3(
