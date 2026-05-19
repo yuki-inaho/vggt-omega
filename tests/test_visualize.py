@@ -8,6 +8,7 @@ import pytest
 from vggt_omega.inference import InferenceResult
 from vggt_omega.visualize import (
     _build_keep_mask,
+    _coerce_results,
     _depth_edge_mask,
     _frame_color,
     _subsample,
@@ -55,6 +56,36 @@ def test_build_keep_mask_respects_conf_threshold() -> None:
     assert keep.sum() > 0
 
 
+def test_build_keep_mask_clips_conf_percent() -> None:
+    res = _fake_inference_result()
+    keep = _build_keep_mask(
+        conf=res.depth_conf,
+        colors=res.image,
+        depth=res.depth_map,
+        conf_percent=500.0,
+        mask_black_bg=False,
+        mask_white_bg=False,
+        filter_depth_edges=False,
+        depth_edge_rtol=0.03,
+    )
+    assert keep.sum() >= 1
+
+
+def test_build_keep_mask_rejects_nan_conf_percent() -> None:
+    res = _fake_inference_result()
+    with pytest.raises(ValueError):
+        _build_keep_mask(
+            conf=res.depth_conf,
+            colors=res.image,
+            depth=res.depth_map,
+            conf_percent=float("nan"),
+            mask_black_bg=False,
+            mask_white_bg=False,
+            filter_depth_edges=False,
+            depth_edge_rtol=0.03,
+        )
+
+
 def test_build_keep_mask_black_white_filters() -> None:
     res = _fake_inference_result()
     res.image[:, :, :] = 0  # all black
@@ -96,6 +127,11 @@ def test_frame_color_distinct_across_frames() -> None:
 def test_make_blueprint_constructs() -> None:
     bp = make_blueprint()
     assert bp is not None
+
+
+def test_coerce_results_rejects_empty() -> None:
+    with pytest.raises(ValueError):
+        _coerce_results([])
 
 
 def test_save_results_to_rrd_writes_file(tmp_path: Path) -> None:

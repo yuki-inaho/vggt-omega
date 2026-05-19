@@ -19,6 +19,7 @@ representation they happen to have.
 
 from __future__ import annotations
 
+import colorsys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -61,6 +62,7 @@ def _build_keep_mask(
     filter_depth_edges: bool,
     depth_edge_rtol: float,
 ) -> Bool[np.ndarray, "h w"]:
+    conf_percent = _normalize_conf_percent(conf_percent)
     valid = np.isfinite(conf)
     threshold = np.percentile(conf[valid], conf_percent) if conf_percent > 0 and valid.any() else 0.0
     keep = valid & (conf >= threshold) & (conf > 1e-5)
@@ -71,6 +73,12 @@ def _build_keep_mask(
     if filter_depth_edges and depth is not None:
         keep &= ~_depth_edge_mask(depth, rtol=depth_edge_rtol)
     return keep
+
+
+def _normalize_conf_percent(conf_percent: float) -> float:
+    if not np.isfinite(conf_percent):
+        raise ValueError(f"conf_percent must be finite, got {conf_percent!r}")
+    return float(np.clip(conf_percent, 0.0, 100.0))
 
 
 def _subsample(
@@ -143,11 +151,9 @@ def _log_camera_frustum(idx: int, result: InferenceResult, color: tuple[int, int
 
 
 def _frame_color(idx: int, total: int) -> tuple[int, int, int]:
-    # Map frame index to a perceptually distinct hue (matches Gradio demo).
-    from matplotlib import colormaps
-
-    rgba = colormaps.get_cmap("gist_rainbow")(idx / max(total, 1))
-    return tuple(int(255 * c) for c in rgba[:3])  # type: ignore[return-value]
+    # Map frame index to a distinct hue without pulling matplotlib into this module.
+    r, g, b = colorsys.hsv_to_rgb((idx / max(total, 1)) % 1.0, 0.85, 1.0)
+    return int(255 * r), int(255 * g), int(255 * b)
 
 
 def _log_frame(
@@ -195,8 +201,12 @@ def _log_frame(
 
 def _coerce_results(results: SceneResult | Sequence[InferenceResult]) -> list[InferenceResult]:
     if isinstance(results, SceneResult):
-        return scene_result_to_inference_results(results)
-    return list(results)
+        coerced = scene_result_to_inference_results(results)
+    else:
+        coerced = list(results)
+    if not coerced:
+        raise ValueError("At least one inference result is required for visualization")
+    return coerced
 
 
 def _log_all_frames(

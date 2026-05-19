@@ -5,7 +5,7 @@ set shell := ["bash", "-cu"]
 # Run `just` (no args) to list everything.
 # ---------------------------------------------------------------------------
 
-uv := "uv run --extra demo"
+uv := "uv run --extra demo --extra viz"
 ckpt_512 := env_var_or_default("VGGT_OMEGA_CKPT", "checkpoints/vggt_omega_1b_512.pt")
 ckpt_256 := env_var_or_default("VGGT_OMEGA_CKPT_256", "checkpoints/vggt_omega_1b_256_text.pt")
 
@@ -14,7 +14,7 @@ default:
 
 # Install / refresh the dev environment from pyproject.toml.
 sync:
-    uv sync --extra demo
+    uv sync --extra demo --extra viz
 
 # Format Python files in place.
 format:
@@ -43,7 +43,7 @@ complexity:
 
 # Run the regression test suite (CPU only by default).
 test *ARGS:
-    {{uv}} pytest {{ARGS}}
+    {{uv}} pytest -m "not gpu" {{ARGS}}
 
 # Run GPU-marked tests (requires CUDA + a checkpoint).
 test-gpu *ARGS:
@@ -58,7 +58,7 @@ demo *ARGS:
 
 # Launch the Gradio demo with the text-aligned 256-px checkpoint.
 demo-text *ARGS:
-    {{uv}} python demo_gradio.py --checkpoint {{ckpt_256}} --image-resolution 256 {{ARGS}}
+    {{uv}} python demo_gradio.py --checkpoint {{ckpt_256}} --image-resolution 256 --enable-alignment {{ARGS}}
 
 # Quick CLI smoke test: extract frames from an example video and run inference.
 smoke ckpt=ckpt_512 video="examples/forest_road.mp4" frames="4":
@@ -80,11 +80,15 @@ viz-viewer video="examples/forest_road.mp4" frames="6":
         --num-frames {{frames}} --image-resolution 512 \
         --mode viewer
 
-# Screenshot the web viewer via Playwright (headless ok). Re-uses an existing .rrd if given.
+# Screenshot the web viewer via Playwright (headless ok). Re-uses an existing .rrd when present.
 viz-screenshot video="examples/forest_road.mp4" rrd="outputs/scene.rrd" png="outputs/scene.png" frames="6":
-    {{uv}} python scripts/visualize.py --checkpoint {{ckpt_512}} --video {{video}} \
-        --num-frames {{frames}} --image-resolution 512 \
-        --mode screenshot --rrd-input {{rrd}} --output {{png}}
+    if [ -f "{{rrd}}" ]; then \
+        {{uv}} python scripts/visualize.py --mode screenshot --rrd-input "{{rrd}}" --output "{{png}}"; \
+    else \
+        {{uv}} python scripts/visualize.py --checkpoint {{ckpt_512}} --video "{{video}}" \
+            --num-frames {{frames}} --image-resolution 512 \
+            --mode screenshot --rrd-output "{{rrd}}" --output "{{png}}"; \
+    fi
 
 # Install Playwright browsers (needed once for `just viz-screenshot`).
 viz-browsers:

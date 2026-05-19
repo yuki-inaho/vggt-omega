@@ -4,6 +4,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.ty_cache/
+.coverage
+htmlcov/
+playwright-report/
+test-results/
 .venv/
 venv/
 build/
@@ -11,6 +16,9 @@ dist/
 outputs/
 demo_outputs/
 checkpoints/
+*.rrd
+*.glb
+predictions.npz
 skyseg.onnx
 skyseg.onnx.tmp
 *.pt

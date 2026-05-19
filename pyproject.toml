@@ -14,6 +14,8 @@ dependencies = [
     "einops",
     "safetensors",
     "opencv-python",
+    "torch>=2.3",
+    "torchvision>=0.18",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,10 @@ demo = [
 ]
 export = [
     "pycolmap>=3.10.0",
+]
+viz = [
+    "playwright>=1.60.0",
+    "rerun-sdk>=0.23.1",
 ]
 
 [build-system]
@@ -129,4 +135,3 @@ exclude = [
     "outputs",
     "vggt_omega/models",
 ]
-
