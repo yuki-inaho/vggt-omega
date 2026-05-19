@@ -17,21 +17,42 @@ import numpy as np
 import torch
 
 from vggt_omega.pipeline import VGGTOmegaPipeline
+from vggt_omega.preprocess import load_images_from_paths
 from visual_util import predictions_to_glb
 
+DEMO_CSS = """
+.custom-log * {
+    font-style: italic;
+    font-size: 22px !important;
+    background-image: linear-gradient(120deg, #0ea5e9 0%, #6ee7b7 60%, #34d399 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    font-weight: bold !important;
+    color: transparent !important;
+    text-align: center !important;
+}
+"""
 
-def load_pipeline(checkpoint_path: str) -> VGGTOmegaPipeline:
+
+def make_theme():
+    theme = gr.themes.Ocean()
+    theme.set(
+        checkbox_label_background_fill_selected="*button_primary_background_fill",
+        checkbox_label_text_color_selected="*button_primary_text_color",
+    )
+    return theme
+
+
+def load_pipeline(checkpoint_path: str, enable_alignment: bool = False) -> VGGTOmegaPipeline:
     if not torch.cuda.is_available():
         raise gr.Error("CUDA is required to run VGGT-Omega.")
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    return VGGTOmegaPipeline(checkpoint_path=checkpoint_path)
+    return VGGTOmegaPipeline(checkpoint_path=checkpoint_path, enable_alignment=enable_alignment)
 
 
 def run_model(target_dir: str, pipeline: VGGTOmegaPipeline, image_resolution: int) -> dict:
     print(f"Processing images from {target_dir}")
-    from vggt_omega.preprocess import load_images_from_paths
-
     image_names = sorted(glob.glob(os.path.join(target_dir, "images", "*")))
     if len(image_names) == 0:
         raise gr.Error("No images found. Please upload images or a video first.")
@@ -268,28 +289,7 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
             max_points_k,
         )
 
-    theme = gr.themes.Ocean()
-    theme.set(
-        checkbox_label_background_fill_selected="*button_primary_background_fill",
-        checkbox_label_text_color_selected="*button_primary_text_color",
-    )
-
-    with gr.Blocks(
-        theme=theme,
-        css="""
-        .custom-log * {
-            font-style: italic;
-            font-size: 22px !important;
-            background-image: linear-gradient(120deg, #0ea5e9 0%, #6ee7b7 60%, #34d399 100%);
-            -webkit-background-clip: text;
-            background-clip: text;
-            font-weight: bold !important;
-            color: transparent !important;
-            text-align: center !important;
-        }
-
-        """,
-    ) as demo:
+    with gr.Blocks() as demo:
         gr.HTML(
             """
         <h1>🌀 VGGT-Ω</h1>
@@ -335,7 +335,7 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
                     label="Preview",
                     columns=4,
                     height="300px",
-                    show_download_button=True,
+                    buttons=["download", "fullscreen"],
                     object_fit="contain",
                     preview=True,
                 )
@@ -497,6 +497,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="VGGT-Omega Gradio demo")
     parser.add_argument("--checkpoint", required=True, help="Local VGGT-Omega checkpoint path.")
     parser.add_argument("--image-resolution", type=int, default=512, help="Input image resolution. Default: 512.")
+    parser.add_argument("--enable-alignment", action="store_true", help="Enable the text-alignment head.")
     parser.add_argument("--server-name", default="0.0.0.0")
     parser.add_argument("--server-port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
@@ -506,13 +507,15 @@ def parse_args():
 def main():
     args = parse_args()
     print(f"Loading checkpoint from {args.checkpoint}")
-    pipeline = load_pipeline(args.checkpoint)
+    pipeline = load_pipeline(args.checkpoint, enable_alignment=args.enable_alignment)
     demo = build_ui(pipeline, args.image_resolution)
     demo.queue(max_size=20).launch(
         server_name=args.server_name,
         server_port=args.server_port,
         share=args.share,
         show_error=True,
+        theme=make_theme(),
+        css=DEMO_CSS,
     )
 
 
