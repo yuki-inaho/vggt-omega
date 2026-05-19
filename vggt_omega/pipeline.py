@@ -101,7 +101,7 @@ class VGGTOmegaPipeline:
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         model = VGGTOmega(enable_alignment=enable_alignment).eval()
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict)
         return model.to(device)
 
@@ -116,6 +116,8 @@ class VGGTOmegaPipeline:
 def _predictions_to_scene_result(predictions: dict[str, torch.Tensor]) -> SceneResult:
     images = predictions["images"]
     extrinsic, intrinsic = encoding_to_camera(predictions["pose_enc"], images.shape[-2:])
+    if intrinsic is None:
+        raise ValueError("encoding_to_camera unexpectedly returned no intrinsics")
 
     def to_np(tensor: torch.Tensor) -> np.ndarray:
         array = tensor.detach().float().cpu().numpy()

@@ -45,6 +45,8 @@ def test_predictions_to_scene_result_shapes() -> None:
     assert scene.intrinsic.shape == (3, 3, 3)
     assert scene.depth.shape == (3, 16, 24, 1)
     assert scene.depth_conf.shape == (3, 16, 24)
+    assert scene.camera_tokens is not None
+    assert scene.register_tokens is not None
     assert scene.camera_tokens.shape == (3, 1, 32)
     assert scene.register_tokens.shape == (3, 16, 32)
 
@@ -78,17 +80,17 @@ def test_pipeline_run_smoke() -> None:
     from pathlib import Path
 
     from vggt_omega.pipeline import VGGTOmegaPipeline
-    from vggt_omega.utils.load_fn import load_and_preprocess_images
+    from vggt_omega.preprocess import preprocess_images, read_images_from_video
 
     ckpt = Path("checkpoints/vggt_omega_1b_512.pt")
-    if not ckpt.is_file() or not torch.cuda.is_available():
-        pytest.skip("smoke test requires GPU and 512 checkpoint")
+    video = Path("examples/forest_road.mp4")
+    if not ckpt.is_file() or not video.is_file() or not torch.cuda.is_available():
+        pytest.skip("smoke test requires GPU, 512 checkpoint, and example video")
 
     pipe = VGGTOmegaPipeline(ckpt)
-    images = load_and_preprocess_images(
-        sorted(str(p) for p in Path("/tmp/vggt_cli_test/images").glob("*.png"))[:2],
-        image_resolution=512,
-    )
+    frames = read_images_from_video(video, sample_fps=1.0, max_frames=2)
+    images = preprocess_images(frames, image_resolution=512)
     scene = pipe.run(images).with_world_points()
     assert scene.depth.shape[0] == 2
+    assert scene.world_points is not None
     assert scene.world_points.shape[-1] == 3

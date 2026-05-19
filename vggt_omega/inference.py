@@ -63,11 +63,16 @@ class VGGTOmegaInference(nn.Module):
             device=self.device_obj,
             enable_alignment=enable_alignment,
         )
+        self.model = self.pipeline.model
 
-    @property
-    def model(self) -> nn.Module:
-        """Underlying VGGT-Omega backbone (for parity with VGGTInference.model)."""
-        return self.pipeline.model
+    def _apply(self, fn, recurse: bool = True):  # type: ignore[override]
+        module = super()._apply(fn, recurse=recurse)
+        self._sync_pipeline_device()
+        return module
+
+    def _sync_pipeline_device(self) -> None:
+        self.device_obj = next(self.model.parameters()).device
+        self.pipeline.device = self.device_obj
 
     def forward(
         self,
@@ -85,6 +90,8 @@ class VGGTOmegaInference(nn.Module):
 
 def scene_result_to_inference_results(scene: SceneResult) -> list[InferenceResult]:
     scene = scene.with_world_points()
+    if scene.world_points is None:
+        raise ValueError("SceneResult.with_world_points() did not populate world_points")
     images = scene.images.detach().cpu().numpy() if isinstance(scene.images, torch.Tensor) else scene.images
     rgb_uint8 = (np.transpose(images, (0, 2, 3, 1)) * 255.0).clip(0, 255).astype(np.uint8)
     num_frames, height, width, _ = rgb_uint8.shape

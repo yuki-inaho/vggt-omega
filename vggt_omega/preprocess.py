@@ -43,6 +43,7 @@ def load_images_from_paths(
 def read_images_from_video(
     video_path: str | Path,
     sample_fps: float = 1.0,
+    max_frames: int | None = None,
 ) -> list[UInt8[np.ndarray, "h w 3"]]:
     """Decode a video to RGB numpy frames sampled at ``sample_fps``.
 
@@ -56,6 +57,7 @@ def read_images_from_video(
     fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
     sample_fps = max(float(sample_fps), 0.1)
     frame_interval = max(int(round(fps / sample_fps)), 1)
+    max_frames = None if max_frames is None or max_frames <= 0 else int(max_frames)
 
     frames: list[np.ndarray] = []
     frame_idx = 0
@@ -66,6 +68,8 @@ def read_images_from_video(
                 break
             if frame_idx % frame_interval == 0:
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                if max_frames is not None and len(frames) >= max_frames:
+                    break
             frame_idx += 1
     finally:
         cap.release()
@@ -125,9 +129,7 @@ def _preprocess_in_memory(
     tensors: list[torch.Tensor] = []
     shapes: set[tuple[int, int]] = set()
     for frame in images:
-        if frame.ndim != 3 or frame.shape[-1] != 3:
-            raise ValueError(f"Expected HxWx3 RGB array, got shape {frame.shape}")
-        pil = Image.fromarray(frame.astype(np.uint8) if frame.dtype != np.uint8 else frame, mode="RGB")
+        pil = Image.fromarray(_as_uint8_rgb(frame))
         pil = _crop_to_supported_aspect_ratio(pil)
         width, height = pil.size
         aspect_ratio = height / max(width, 1)
@@ -158,6 +160,21 @@ def _preprocess_via_disk(
     paths: list[str] = []
     for idx, frame in enumerate(images):
         out = tmp_dir / f"frame_{idx:06d}.png"
-        Image.fromarray(frame.astype(np.uint8) if frame.dtype != np.uint8 else frame).save(out)
+        Image.fromarray(_as_uint8_rgb(frame)).save(out)
         paths.append(str(out))
     return load_and_preprocess_images(paths, mode=mode, image_resolution=image_resolution, patch_size=patch_size)
+
+
+def _as_uint8_rgb(frame: np.ndarray) -> np.ndarray:
+    array = np.asarray(frame)
+    if array.ndim != 3 or array.shape[-1] != 3:
+        raise ValueError(f"Expected HxWx3 RGB array, got shape {array.shape}")
+    if array.dtype == np.uint8:
+        return array
+
+    if np.issubdtype(array.dtype, np.floating):
+        array = np.nan_to_num(array, nan=0.0, posinf=255.0, neginf=0.0)
+        if array.size and float(array.min()) >= 0.0 and float(array.max()) <= 1.0:
+            array = array * 255.0
+
+    return np.clip(array, 0, 255).astype(np.uint8)

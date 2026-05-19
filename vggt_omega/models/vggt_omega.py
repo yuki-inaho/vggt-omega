@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import warnings
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -36,8 +37,13 @@ class VGGTOmega(nn.Module):
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
 
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+        if images.device.type == "cuda":
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            autocast_context = torch.autocast(device_type="cuda", dtype=amp_dtype)
+        else:
+            autocast_context = nullcontext()
+
+        with autocast_context:
             aggregated_tokens_list, patch_token_start = self.aggregator(images)
 
         final_tokens = aggregated_tokens_list[-1]

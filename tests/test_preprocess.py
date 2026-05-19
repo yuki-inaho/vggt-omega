@@ -44,6 +44,23 @@ def test_preprocess_images_validates_shape(rng: np.random.Generator) -> None:
         preprocess_images([rng.integers(0, 256, size=(32, 32), dtype=np.uint8)], image_resolution=128)
 
 
+def test_preprocess_images_validates_shape_via_disk(rng: np.random.Generator, tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        preprocess_images(
+            [rng.integers(0, 256, size=(32, 32), dtype=np.uint8)],
+            image_resolution=128,
+            tmp_dir=tmp_path / "frames",
+        )
+
+
+def test_preprocess_images_scales_unit_float_input(rng: np.random.Generator) -> None:
+    frame = rng.random((32, 32, 3), dtype=np.float32)
+    out = preprocess_images([frame], image_resolution=64)
+    assert out.max() > 0.5
+    assert out.min() >= 0.0
+    assert out.max() <= 1.0
+
+
 def test_preprocess_images_disk_path_matches_in_memory(rng: np.random.Generator, tmp_path: Path) -> None:
     frames = [_make_frame(rng, h=64, w=96) for _ in range(2)]
     in_mem = preprocess_images(frames, image_resolution=128, mode="balanced")
@@ -69,6 +86,14 @@ def test_read_images_from_video_yields_frames() -> None:
     frames = read_images_from_video(video, sample_fps=0.5)
     assert len(frames) >= 1
     assert frames[0].ndim == 3 and frames[0].shape[-1] == 3
+
+
+def test_read_images_from_video_respects_max_frames() -> None:
+    video = Path("examples/forest_road.mp4")
+    if not video.is_file():
+        pytest.skip("example video missing")
+    frames = read_images_from_video(video, sample_fps=1.0, max_frames=1)
+    assert len(frames) == 1
 
 
 def test_read_images_from_video_missing_raises(tmp_path: Path) -> None:

@@ -36,6 +36,7 @@ def test_extri_intri_pose_encoding_roundtrip() -> None:
 
     extr_rec, intr_rec = encoding_to_camera(pose_enc, (H, W))
     assert extr_rec.shape == extr.shape
+    assert intr_rec is not None
     assert intr_rec.shape == intr.shape
     assert torch.allclose(extr_rec, extr, atol=1e-4)
     assert torch.allclose(intr_rec, intr, atol=1e-3)

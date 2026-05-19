@@ -17,25 +17,28 @@ def closed_form_inverse_se3(
     se3: ArrayOrTensor, R: ArrayOrTensor | None = None, T: ArrayOrTensor | None = None
 ) -> ArrayOrTensor:
     """Invert a batch of 3x4 or 4x4 SE(3) matrices."""
-    is_numpy = isinstance(se3, np.ndarray)
-
     if se3.shape[-2:] != (4, 4) and se3.shape[-2:] != (3, 4):
         raise ValueError(f"se3 must have shape (N, 4, 4) or (N, 3, 4), got {se3.shape}")
 
-    if R is None:
-        R = se3[:, :3, :3]
-    if T is None:
-        T = se3[:, :3, 3:]
+    rotation = se3[:, :3, :3] if R is None else R
+    translation = se3[:, :3, 3:] if T is None else T
 
-    if is_numpy:
-        R_t = np.transpose(R, (0, 2, 1))
-        top_right = -np.matmul(R_t, T)
-        inverted = np.tile(np.eye(4), (len(R), 1, 1))
-    else:
-        R_t = R.transpose(1, 2)
-        top_right = -torch.bmm(R_t, T)
-        inverted = torch.eye(4, device=R.device, dtype=R.dtype)[None].repeat(len(R), 1, 1)
+    if isinstance(se3, np.ndarray):
+        if not isinstance(rotation, np.ndarray) or not isinstance(translation, np.ndarray):
+            raise TypeError("R and T must be numpy arrays when se3 is a numpy array")
+        R_t = np.transpose(rotation, (0, 2, 1))
+        top_right = -np.matmul(R_t, translation)
+        inverted = np.tile(np.eye(4, dtype=rotation.dtype), (len(rotation), 1, 1))
+        inverted[:, :3, :3] = R_t
+        inverted[:, :3, 3:] = top_right
+        return inverted
 
+    if not isinstance(rotation, torch.Tensor) or not isinstance(translation, torch.Tensor):
+        raise TypeError("R and T must be torch tensors when se3 is a torch tensor")
+
+    R_t = rotation.transpose(1, 2)
+    top_right = -torch.bmm(R_t, translation)
+    inverted = torch.eye(4, device=rotation.device, dtype=rotation.dtype)[None].repeat(len(rotation), 1, 1)
     inverted[:, :3, :3] = R_t
     inverted[:, :3, 3:] = top_right
     return inverted
