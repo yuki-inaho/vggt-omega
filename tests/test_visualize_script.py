@@ -106,6 +106,37 @@ def test_rrd_input_is_screenshot_only() -> None:
         visualize_cli.main(["--mode", "rrd", "--rrd-input", "existing.rrd"])
 
 
+def test_rrd_mode_honors_no_accumulate_points(monkeypatch, tmp_path: Path) -> None:
+    out = tmp_path / "scene.rrd"
+    calls: dict[str, bool] = {}
+
+    monkeypatch.setattr(visualize_cli, "_run_inference", lambda args: object())
+
+    def fake_save_results_to_rrd(*args, **kwargs) -> Path:
+        calls["accumulate_points"] = kwargs["accumulate_points"]
+        out.write_bytes(b"rrd")
+        return out
+
+    monkeypatch.setattr(visualize_cli, "save_results_to_rrd", fake_save_results_to_rrd)
+
+    code = visualize_cli.main(
+        [
+            "--mode",
+            "rrd",
+            "--checkpoint",
+            "dummy.pt",
+            "--video",
+            "input.mp4",
+            "--output",
+            str(out),
+            "--no-accumulate-points",
+        ]
+    )
+
+    assert code == 0
+    assert calls == {"accumulate_points": False}
+
+
 def test_capture_rejects_missing_rrd(tmp_path: Path) -> None:
     args = visualize_cli._build_parser().parse_args(["--mode", "screenshot", "--rrd-input", "missing.rrd"])
     with pytest.raises(SystemExit, match="RRD input not found"):

@@ -166,6 +166,7 @@ def _log_frame(
     filter_depth_edges: bool,
     depth_edge_rtol: float,
     max_points: int,
+    accumulate_points: bool,
 ) -> None:
     rr.set_time("frame", sequence=idx)
 
@@ -187,9 +188,9 @@ def _log_frame(
     pts_kept, rgb_kept = _subsample(pts[keep_flat], rgb[keep_flat], max_points)
 
     rr.log(
-        f"world/points_{idx:03d}",
+        f"world/points_{idx:03d}" if accumulate_points else "world/points",
         rr.Points3D(pts_kept, colors=rgb_kept, radii=0.0005),
-        static=True,
+        static=accumulate_points,
     )
 
     rr.log("frame/image", rr.Image(result.image))
@@ -217,6 +218,7 @@ def _log_all_frames(
     filter_depth_edges: bool,
     depth_edge_rtol: float,
     max_points: int,
+    accumulate_points: bool,
 ) -> None:
     _log_static_world()
     for idx, result in enumerate(results):
@@ -230,6 +232,7 @@ def _log_all_frames(
             filter_depth_edges=filter_depth_edges,
             depth_edge_rtol=depth_edge_rtol,
             max_points=max_points,
+            accumulate_points=accumulate_points,
         )
 
 
@@ -247,6 +250,7 @@ def visualize_results(
     filter_depth_edges: bool = True,
     depth_edge_rtol: float = 0.03,
     max_points: int = 1_000_000,
+    accumulate_points: bool = True,
     app_id: str = DEFAULT_APP_ID,
     spawn: bool = True,
 ) -> None:
@@ -261,6 +265,7 @@ def visualize_results(
         filter_depth_edges=filter_depth_edges,
         depth_edge_rtol=depth_edge_rtol,
         max_points=max_points,
+        accumulate_points=accumulate_points,
     )
 
 
@@ -274,6 +279,7 @@ def save_results_to_rrd(
     filter_depth_edges: bool = True,
     depth_edge_rtol: float = 0.03,
     max_points: int = 1_000_000,
+    accumulate_points: bool = True,
     app_id: str = DEFAULT_APP_ID,
 ) -> Path:
     """Write the same visualization to an ``.rrd`` file without opening a viewer."""
@@ -289,6 +295,7 @@ def save_results_to_rrd(
         filter_depth_edges=filter_depth_edges,
         depth_edge_rtol=depth_edge_rtol,
         max_points=max_points,
+        accumulate_points=accumulate_points,
     )
     rr.disconnect()
     return rrd_path

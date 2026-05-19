@@ -74,6 +74,12 @@ viz-rrd video="examples/forest_road.mp4" output="outputs/scene.rrd" frames="6":
         --num-frames {{frames}} --image-resolution 512 \
         --mode rrd --output {{output}}
 
+# Write a smoother playback .rrd: sample by FPS and show only the current frame's point cloud.
+viz-rrd-fast video="examples/forest_road.mp4" output="outputs/scene_fast.rrd" fps="8.0" max_points="15000":
+    {{uv}} python scripts/visualize.py --checkpoint {{ckpt_512}} --video "{{video}}" \
+        --sample-fps {{fps}} --image-resolution 512 \
+        --mode rrd --output "{{output}}" --max-points {{max_points}} --no-accumulate-points
+
 # Launch the local Rerun viewer (requires a display).
 viz-viewer video="examples/forest_road.mp4" frames="6":
     {{uv}} python scripts/visualize.py --checkpoint {{ckpt_512}} --video {{video}} \

@@ -90,6 +90,7 @@ def _mode_viewer(args: argparse.Namespace) -> None:
         filter_depth_edges=args.filter_depth_edges,
         depth_edge_rtol=args.depth_edge_rtol,
         max_points=args.max_points,
+        accumulate_points=args.accumulate_points,
         spawn=True,
     )
 
@@ -106,6 +107,7 @@ def _mode_rrd(args: argparse.Namespace, output: Path | None = None) -> Path:
         filter_depth_edges=args.filter_depth_edges,
         depth_edge_rtol=args.depth_edge_rtol,
         max_points=args.max_points,
+        accumulate_points=args.accumulate_points,
     )
     print(f"Wrote rerun recording to {out}")
     return out
@@ -257,6 +259,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--filter-depth-edges", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--depth-edge-rtol", type=float, default=0.03)
     p.add_argument("--max-points", type=int, default=1_000_000)
+    p.add_argument(
+        "--accumulate-points",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show all frame point clouds at once; disable for smoother timeline playback",
+    )
 
     # Screenshot-only settings.
     p.add_argument("--width", type=int, default=1600)
