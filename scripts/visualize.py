@@ -91,6 +91,7 @@ def _mode_viewer(args: argparse.Namespace) -> None:
         depth_edge_rtol=args.depth_edge_rtol,
         max_points=args.max_points,
         accumulate_points=args.accumulate_points,
+        frame_offset=args.frame_offset,
         spawn=True,
     )
 
@@ -108,6 +109,7 @@ def _mode_rrd(args: argparse.Namespace, output: Path | None = None) -> Path:
         depth_edge_rtol=args.depth_edge_rtol,
         max_points=args.max_points,
         accumulate_points=args.accumulate_points,
+        frame_offset=args.frame_offset,
     )
     print(f"Wrote rerun recording to {out}")
     return out
@@ -265,6 +267,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Show all frame point clouds at once; disable for smoother timeline playback",
     )
+    p.add_argument("--frame-offset", type=int, default=0, help="Starting Rerun frame index for split recordings")
 
     # Screenshot-only settings.
     p.add_argument("--width", type=int, default=1600)

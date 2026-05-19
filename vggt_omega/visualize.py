@@ -219,13 +219,15 @@ def _log_all_frames(
     depth_edge_rtol: float,
     max_points: int,
     accumulate_points: bool,
+    frame_offset: int,
 ) -> None:
     _log_static_world()
-    for idx, result in enumerate(results):
+    for local_idx, result in enumerate(results):
+        frame_idx = frame_offset + local_idx
         _log_frame(
-            idx,
+            frame_idx,
             result,
-            color=_frame_color(idx, len(results)),
+            color=_frame_color(frame_idx, max(frame_offset + len(results), len(results))),
             conf_percent=conf_percent,
             mask_black_bg=mask_black_bg,
             mask_white_bg=mask_white_bg,
@@ -251,6 +253,7 @@ def visualize_results(
     depth_edge_rtol: float = 0.03,
     max_points: int = 1_000_000,
     accumulate_points: bool = True,
+    frame_offset: int = 0,
     app_id: str = DEFAULT_APP_ID,
     spawn: bool = True,
 ) -> None:
@@ -266,6 +269,7 @@ def visualize_results(
         depth_edge_rtol=depth_edge_rtol,
         max_points=max_points,
         accumulate_points=accumulate_points,
+        frame_offset=frame_offset,
     )
 
 
@@ -280,6 +284,7 @@ def save_results_to_rrd(
     depth_edge_rtol: float = 0.03,
     max_points: int = 1_000_000,
     accumulate_points: bool = True,
+    frame_offset: int = 0,
     app_id: str = DEFAULT_APP_ID,
 ) -> Path:
     """Write the same visualization to an ``.rrd`` file without opening a viewer."""
@@ -296,6 +301,7 @@ def save_results_to_rrd(
         depth_edge_rtol=depth_edge_rtol,
         max_points=max_points,
         accumulate_points=accumulate_points,
+        frame_offset=frame_offset,
     )
     rr.disconnect()
     return rrd_path

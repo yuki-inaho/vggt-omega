@@ -106,14 +106,15 @@ def test_rrd_input_is_screenshot_only() -> None:
         visualize_cli.main(["--mode", "rrd", "--rrd-input", "existing.rrd"])
 
 
-def test_rrd_mode_honors_no_accumulate_points(monkeypatch, tmp_path: Path) -> None:
+def test_rrd_mode_honors_playback_options(monkeypatch, tmp_path: Path) -> None:
     out = tmp_path / "scene.rrd"
-    calls: dict[str, bool] = {}
+    calls: dict[str, bool | int] = {}
 
     monkeypatch.setattr(visualize_cli, "_run_inference", lambda args: object())
 
     def fake_save_results_to_rrd(*args, **kwargs) -> Path:
         calls["accumulate_points"] = kwargs["accumulate_points"]
+        calls["frame_offset"] = kwargs["frame_offset"]
         out.write_bytes(b"rrd")
         return out
 
@@ -130,11 +131,13 @@ def test_rrd_mode_honors_no_accumulate_points(monkeypatch, tmp_path: Path) -> No
             "--output",
             str(out),
             "--no-accumulate-points",
+            "--frame-offset",
+            "24",
         ]
     )
 
     assert code == 0
-    assert calls == {"accumulate_points": False}
+    assert calls == {"accumulate_points": False, "frame_offset": 24}
 
 
 def test_capture_rejects_missing_rrd(tmp_path: Path) -> None:
