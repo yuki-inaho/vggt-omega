@@ -16,91 +16,32 @@ import gradio as gr
 import numpy as np
 import torch
 
-from vggt_omega.models import VGGTOmega
-from vggt_omega.utils.load_fn import load_and_preprocess_images
-from vggt_omega.utils.pose_enc import encoding_to_camera
+from vggt_omega.pipeline import VGGTOmegaPipeline
 from visual_util import predictions_to_glb
 
 
-def load_model(checkpoint_path: str) -> VGGTOmega:
+def load_pipeline(checkpoint_path: str) -> VGGTOmegaPipeline:
     if not torch.cuda.is_available():
         raise gr.Error("CUDA is required to run VGGT-Omega.")
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    model = VGGTOmega().eval()
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(state_dict)
-    return model.to("cuda")
+    return VGGTOmegaPipeline(checkpoint_path=checkpoint_path)
 
 
-def run_model(target_dir: str, model: VGGTOmega, image_resolution: int) -> dict:
+def run_model(target_dir: str, pipeline: VGGTOmegaPipeline, image_resolution: int) -> dict:
     print(f"Processing images from {target_dir}")
+    from vggt_omega.preprocess import load_images_from_paths
 
     image_names = sorted(glob.glob(os.path.join(target_dir, "images", "*")))
     if len(image_names) == 0:
         raise gr.Error("No images found. Please upload images or a video first.")
 
-    images = load_and_preprocess_images(image_names, image_resolution=image_resolution).to("cuda")
+    images = load_images_from_paths(image_names, image_resolution=image_resolution)
     print(f"Preprocessed images shape: {tuple(images.shape)}")
 
-    with torch.inference_mode():
-        predictions = model(images)
-
-    extrinsic, intrinsic = encoding_to_camera(
-        predictions["pose_enc"],
-        predictions["images"].shape[-2:],
-    )
-    predictions["extrinsic"] = extrinsic
-    predictions["intrinsic"] = intrinsic
-
-    predictions_np = {}
-    for key, value in predictions.items():
-        if isinstance(value, torch.Tensor):
-            value = value.detach().float().cpu().numpy()
-            if value.shape[0] == 1:
-                value = value[0]
-            predictions_np[key] = value
-
-    predictions_np["world_points_from_depth"] = unproject_depth_map_to_point_map(
-        predictions_np["depth"],
-        predictions_np["extrinsic"],
-        predictions_np["intrinsic"],
-    )
-
+    scene = pipeline.run(images).with_world_points()
     torch.cuda.empty_cache()
-    return predictions_np
-
-
-def unproject_depth_map_to_point_map(depth_map: np.ndarray, extrinsic: np.ndarray, intrinsic: np.ndarray) -> np.ndarray:
-    depth = depth_map[..., 0]
-    num_frames, height, width = depth.shape
-
-    y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
-    x = np.broadcast_to(x[None], (num_frames, height, width))
-    y = np.broadcast_to(y[None], (num_frames, height, width))
-
-    fx = intrinsic[:, 0, 0][:, None, None]
-    fy = intrinsic[:, 1, 1][:, None, None]
-    cx = intrinsic[:, 0, 2][:, None, None]
-    cy = intrinsic[:, 1, 2][:, None, None]
-
-    camera_points = np.stack(
-        [
-            (x - cx) / fx * depth,
-            (y - cy) / fy * depth,
-            depth,
-        ],
-        axis=-1,
-    )
-
-    rotation = extrinsic[:, :3, :3]
-    translation = extrinsic[:, :3, 3]
-    return np.einsum(
-        "sij,shwj->shwi",
-        np.transpose(rotation, (0, 2, 1)),
-        camera_points - translation[:, None, None, :],
-    )
+    return scene.as_npz_dict()
 
 
 def file_path(file_data) -> str:
@@ -167,7 +108,7 @@ def update_gallery_on_upload(input_video, input_images, video_sample_fps):
 
 def gradio_demo(
     target_dir,
-    model,
+    pipeline,
     image_resolution,
     conf_thres=20.0,
     mask_black_bg=False,
@@ -187,7 +128,7 @@ def gradio_demo(
     target_dir_images = os.path.join(target_dir, "images")
     all_files = sorted(os.listdir(target_dir_images))
 
-    predictions = run_model(target_dir, model, image_resolution)
+    predictions = run_model(target_dir, pipeline, image_resolution)
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
     np.savez(prediction_save_path, **predictions)
 
@@ -305,7 +246,7 @@ lake_speedboat_video = "examples/lake_speedboat.mp4"
 desert_road_video = "examples/desert_road.mp4"
 
 
-def build_ui(model: VGGTOmega, image_resolution: int):
+def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
     def reconstruct(
         target_dir,
         conf_thres,
@@ -317,7 +258,7 @@ def build_ui(model: VGGTOmega, image_resolution: int):
     ):
         return gradio_demo(
             target_dir,
-            model,
+            pipeline,
             image_resolution,
             conf_thres,
             mask_black_bg,
@@ -565,8 +506,8 @@ def parse_args():
 def main():
     args = parse_args()
     print(f"Loading checkpoint from {args.checkpoint}")
-    model = load_model(args.checkpoint)
-    demo = build_ui(model, args.image_resolution)
+    pipeline = load_pipeline(args.checkpoint)
+    demo = build_ui(pipeline, args.image_resolution)
     demo.queue(max_size=20).launch(
         server_name=args.server_name,
         server_port=args.server_port,

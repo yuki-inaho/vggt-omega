@@ -6,8 +6,17 @@
 
 """VGGT-Omega inference package."""
 
+from .inference import InferenceResult, VGGTOmegaInference
 from .models import VGGTOmega
+from .pipeline import SceneResult, VGGTOmegaPipeline
 
 __version__ = "0.0.1"
 
-__all__ = ["VGGTOmega", "__version__"]
+__all__ = [
+    "InferenceResult",
+    "SceneResult",
+    "VGGTOmega",
+    "VGGTOmegaInference",
+    "VGGTOmegaPipeline",
+    "__version__",
+]
