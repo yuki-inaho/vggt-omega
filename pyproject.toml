@@ -43,8 +43,10 @@ include = ["vggt_omega*"]
 dev = [
     "beartype>=0.22.9",
     "jaxtyping>=0.3.7",
+    "playwright>=1.60.0",
     "pytest>=9.0.3",
     "radon>=6.0.1",
+    "rerun-sdk>=0.23.1",
     "ruff>=0.15.13",
     "ty>=0.0.37",
 ]

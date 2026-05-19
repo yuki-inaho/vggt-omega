@@ -64,6 +64,32 @@ demo-text *ARGS:
 smoke ckpt=ckpt_512 video="examples/forest_road.mp4" frames="4":
     {{uv}} python -m vggt_omega.cli smoke --checkpoint {{ckpt}} --video {{video}} --num-frames {{frames}}
 
+# ---------------------------------------------------------------------------
+# Rerun visualization recipes.
+# ---------------------------------------------------------------------------
+
+# Write the reconstruction to a .rrd file (no display required).
+viz-rrd video="examples/forest_road.mp4" output="outputs/scene.rrd" frames="6":
+    {{uv}} python scripts/visualize.py --checkpoint {{ckpt_512}} --video {{video}} \
+        --num-frames {{frames}} --image-resolution 512 \
+        --mode rrd --output {{output}}
+
+# Launch the local Rerun viewer (requires a display).
+viz-viewer video="examples/forest_road.mp4" frames="6":
+    {{uv}} python scripts/visualize.py --checkpoint {{ckpt_512}} --video {{video}} \
+        --num-frames {{frames}} --image-resolution 512 \
+        --mode viewer
+
+# Screenshot the web viewer via Playwright (headless ok). Re-uses an existing .rrd if given.
+viz-screenshot video="examples/forest_road.mp4" rrd="outputs/scene.rrd" png="outputs/scene.png" frames="6":
+    {{uv}} python scripts/visualize.py --checkpoint {{ckpt_512}} --video {{video}} \
+        --num-frames {{frames}} --image-resolution 512 \
+        --mode screenshot --rrd-input {{rrd}} --output {{png}}
+
+# Install Playwright browsers (needed once for `just viz-screenshot`).
+viz-browsers:
+    {{uv}} playwright install chromium
+
 # Remove caches & build artefacts.
 clean:
     rm -rf .pytest_cache .ruff_cache .ty_cache build dist *.egg-info
