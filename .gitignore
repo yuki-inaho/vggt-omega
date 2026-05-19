@@ -7,20 +7,36 @@ __pycache__/
 .ty_cache/
 .coverage
 htmlcov/
+
+# Local tool/agent state.
+.claude/settings.local.json
+
+# Browser/test artifacts.
 playwright-report/
 test-results/
+
+# Local environments and builds.
 .venv/
 venv/
 build/
 dist/
+
+# Generated demo / inference outputs.
 outputs/
 demo_outputs/
 checkpoints/
 *.rrd
+*.rbl
 *.glb
+*.ply
+*.pcd
 predictions.npz
-skyseg.onnx
-skyseg.onnx.tmp
+*.npy
+*.npz
+
+# Large model artifacts.
+*.onnx
+*.onnx.tmp
 *.pt
 *.pth
 *.safetensors
