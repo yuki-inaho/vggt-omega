@@ -16,6 +16,7 @@ from typing import Literal
 import cv2
 import numpy as np
 import torch
+from jaxtyping import Float, UInt8
 from PIL import Image
 
 from .utils.load_fn import load_and_preprocess_images
@@ -28,7 +29,7 @@ def load_images_from_paths(
     image_resolution: int = 512,
     mode: PreprocessMode = "balanced",
     patch_size: int = 16,
-) -> torch.Tensor:
+) -> Float[torch.Tensor, "n_img 3 h w"]:
     """Thin wrapper over the legacy path-based loader for API parity."""
     paths = [str(p) for p in image_paths]
     return load_and_preprocess_images(
@@ -42,7 +43,7 @@ def load_images_from_paths(
 def read_images_from_video(
     video_path: str | Path,
     sample_fps: float = 1.0,
-) -> list[np.ndarray]:
+) -> list[UInt8[np.ndarray, "h w 3"]]:
     """Decode a video to RGB numpy frames sampled at ``sample_fps``.
 
     Returns BGR-to-RGB converted frames so the rest of the preprocessing
@@ -75,12 +76,12 @@ def read_images_from_video(
 
 
 def preprocess_images(
-    images: list[np.ndarray],
+    images: list[UInt8[np.ndarray, "h w 3"]],
     image_resolution: int = 512,
     mode: PreprocessMode = "balanced",
     patch_size: int = 16,
     tmp_dir: str | Path | None = None,
-) -> torch.Tensor:
+) -> Float[torch.Tensor, "n_img 3 h w"]:
     """Preprocess a list of HxWx3 uint8/float RGB arrays into the model tensor.
 
     Routes through the path-based loader so the preprocessing is bit-identical

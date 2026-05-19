@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from jaxtyping import Float
 from torch import nn
 
 from .models import VGGTOmega
@@ -40,16 +41,16 @@ class SceneResult:
       (filled lazily by :meth:`with_world_points`).
     """
 
-    images: torch.Tensor
-    pose_enc: np.ndarray
-    extrinsic: np.ndarray
-    intrinsic: np.ndarray
-    depth: np.ndarray
-    depth_conf: np.ndarray
-    camera_tokens: np.ndarray | None = None
-    register_tokens: np.ndarray | None = None
-    text_alignment_embedding: np.ndarray | None = None
-    world_points: np.ndarray | None = None
+    images: Float[torch.Tensor, "n_img 3 h w"]
+    pose_enc: Float[np.ndarray, "n_img 9"]
+    extrinsic: Float[np.ndarray, "n_img 3 4"]
+    intrinsic: Float[np.ndarray, "n_img 3 3"]
+    depth: Float[np.ndarray, "n_img h w 1"]
+    depth_conf: Float[np.ndarray, "n_img h w"]
+    camera_tokens: Float[np.ndarray, "n_img 1 embed"] | None = None
+    register_tokens: Float[np.ndarray, "n_img reg_tokens embed"] | None = None
+    text_alignment_embedding: Float[np.ndarray, "embed"] | None = None
+    world_points: Float[np.ndarray, "n_img h w 3"] | None = None
 
     def with_world_points(self) -> SceneResult:
         if self.world_points is None:
@@ -105,7 +106,7 @@ class VGGTOmegaPipeline:
         return model.to(device)
 
     @torch.inference_mode()
-    def run(self, images: torch.Tensor) -> SceneResult:
+    def run(self, images: Float[torch.Tensor, "n_img 3 h w"]) -> SceneResult:
         """Run inference on a preprocessed BCHW tensor and return a SceneResult."""
         images = images.to(self.device)
         predictions = self.model(images)

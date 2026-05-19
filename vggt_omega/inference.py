@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from jaxtyping import Float, UInt8
 from torch import nn
 
 from .pipeline import DEFAULT_CHECKPOINT_512, SceneResult, VGGTOmegaPipeline, autodetect_device
@@ -34,14 +35,14 @@ from .preprocess import PreprocessMode, preprocess_images
 class InferenceResult:
     """Per-frame VGGT-Omega output (mirrors the official VGGT signature)."""
 
-    image: np.ndarray  # (H, W, 3) uint8
+    image: UInt8[np.ndarray, "h w 3"]
     width: int
     height: int
-    extrinsic: np.ndarray  # (3, 4)
-    intrinsic: np.ndarray  # (3, 3)
-    depth_map: np.ndarray  # (H, W)
-    depth_conf: np.ndarray  # (H, W)
-    point_map_by_unprojection: np.ndarray  # (H, W, 3)
+    extrinsic: Float[np.ndarray, "3 4"]
+    intrinsic: Float[np.ndarray, "3 3"]
+    depth_map: Float[np.ndarray, "h w"]
+    depth_conf: Float[np.ndarray, "h w"]
+    point_map_by_unprojection: Float[np.ndarray, "h w 3"]
 
 
 class VGGTOmegaInference(nn.Module):
@@ -70,7 +71,7 @@ class VGGTOmegaInference(nn.Module):
 
     def forward(
         self,
-        input_images: list[np.ndarray],
+        input_images: list[UInt8[np.ndarray, "h w 3"]],
         mode: PreprocessMode = "balanced",
     ) -> list[InferenceResult]:
         tensor = preprocess_images(

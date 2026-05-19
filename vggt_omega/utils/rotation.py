@@ -6,11 +6,14 @@
 
 # Modified from PyTorch3D, https://github.com/facebookresearch/pytorch3d
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
+from jaxtyping import Float
 
 
-def quat_to_mat(quaternions: torch.Tensor) -> torch.Tensor:
+def quat_to_mat(quaternions: Float[torch.Tensor, "*batch 4"]) -> Float[torch.Tensor, "*batch 3 3"]:
     """
     Quaternion Order: XYZW or say ijkr, scalar-last
 
@@ -42,7 +45,7 @@ def quat_to_mat(quaternions: torch.Tensor) -> torch.Tensor:
     return o.reshape(quaternions.shape[:-1] + (3, 3))
 
 
-def mat_to_quat(matrix: torch.Tensor) -> torch.Tensor:
+def mat_to_quat(matrix: Float[torch.Tensor, "*batch 3 3"]) -> Float[torch.Tensor, "*batch 4"]:
     """
     Convert rotations given as rotation matrices to quaternions.
 
@@ -101,7 +104,7 @@ def mat_to_quat(matrix: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _sqrt_positive_part(x: torch.Tensor) -> torch.Tensor:
+def _sqrt_positive_part(x: Float[torch.Tensor, "..."]) -> Float[torch.Tensor, "..."]:
     """
     Returns torch.sqrt(torch.max(0, x))
     but with a zero subgradient where x is 0.
@@ -115,7 +118,7 @@ def _sqrt_positive_part(x: torch.Tensor) -> torch.Tensor:
     return ret
 
 
-def standardize_quaternion(quaternions: torch.Tensor) -> torch.Tensor:
+def standardize_quaternion(quaternions: Float[torch.Tensor, "*batch 4"]) -> Float[torch.Tensor, "*batch 4"]:
     """
     Convert a unit quaternion to a standard form: one in which the real
     part is non negative.

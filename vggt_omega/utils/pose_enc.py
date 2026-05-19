@@ -4,12 +4,19 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import torch
+from jaxtyping import Float
 
 from .rotation import mat_to_quat, quat_to_mat
 
 
-def extri_intri_to_pose_encoding(extrinsics, intrinsics, image_size_hw):
+def extri_intri_to_pose_encoding(
+    extrinsics: Float[torch.Tensor, "b n_img 3 4"],
+    intrinsics: Float[torch.Tensor, "b n_img 3 3"],
+    image_size_hw: tuple[int, int],
+) -> Float[torch.Tensor, "b n_img 9"]:
     """Convert camera extrinsics and intrinsics to VGGT-Omega pose encoding.
 
     The released checkpoints use a 9D camera encoding:
@@ -26,7 +33,11 @@ def extri_intri_to_pose_encoding(extrinsics, intrinsics, image_size_hw):
     return torch.cat([T, quat, fov_h[..., None], fov_w[..., None]], dim=-1).float()
 
 
-def encoding_to_camera(pose_encoding, image_size_hw, build_intrinsics=True):
+def encoding_to_camera(
+    pose_encoding: Float[torch.Tensor, "b n_img 9"],
+    image_size_hw: tuple[int, int],
+    build_intrinsics: bool = True,
+) -> tuple[Float[torch.Tensor, "b n_img 3 4"], Float[torch.Tensor, "b n_img 3 3"] | None]:
     """Decode VGGT-Omega pose encoding into extrinsics and intrinsics."""
     T = pose_encoding[..., :3]
     quat = pose_encoding[..., 3:7]

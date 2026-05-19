@@ -6,11 +6,18 @@
 
 from __future__ import annotations
 
+from typing import TypeVar
+
 import numpy as np
 import torch
+from jaxtyping import Float
+
+ArrayOrTensor = TypeVar("ArrayOrTensor", np.ndarray, torch.Tensor)
 
 
-def closed_form_inverse_se3(se3, R=None, T=None):
+def closed_form_inverse_se3(
+    se3: ArrayOrTensor, R: ArrayOrTensor | None = None, T: ArrayOrTensor | None = None
+) -> ArrayOrTensor:
     """Invert a batch of 3x4 or 4x4 SE(3) matrices."""
     is_numpy = isinstance(se3, np.ndarray)
 
@@ -37,10 +44,10 @@ def closed_form_inverse_se3(se3, R=None, T=None):
 
 
 def unproject_depth_map_to_point_map(
-    depth_map: np.ndarray,
-    extrinsics: np.ndarray,
-    intrinsics: np.ndarray,
-) -> np.ndarray:
+    depth_map: Float[np.ndarray, "n_img h w 1"] | Float[np.ndarray, "n_img h w"],
+    extrinsics: Float[np.ndarray, "n_img 3 4"],
+    intrinsics: Float[np.ndarray, "n_img 3 3"],
+) -> Float[np.ndarray, "n_img h w 3"]:
     """Back-project a per-frame depth map into a world-space point map.
 
     Args:
