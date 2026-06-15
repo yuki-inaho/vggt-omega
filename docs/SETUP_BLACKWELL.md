@@ -4,6 +4,9 @@ Machine-specific, reproducibility-verified setup record for this box. Branch
 name encodes the confirmed CUDA build: **`blackwell-cu130`** (Blackwell GPU +
 torch CUDA 13.0 build).
 
+> 新規エージェントはまず [`docs/ONBOARDING.md`](./ONBOARDING.md)（プロジェクト全体像・
+> 制約・タスク境界）を参照してください。本書はその機械固有の検証付録に相当します。
+
 ## Confirmed hardware / driver
 | Item | Confirmed value |
 |---|---|
