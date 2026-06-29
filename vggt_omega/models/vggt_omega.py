@@ -38,7 +38,12 @@ class VGGTOmega(nn.Module):
             images = images.unsqueeze(0)
 
         if images.device.type == "cuda":
-            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            # Use bf16 only when the GPU supports it in hardware. On Pascal
+            # (e.g. GTX 1070, sm_61) torch.cuda.is_bf16_supported() returns True
+            # via software emulation, but emulated bf16 is ~2x slower than fp16
+            # here; fall back to fp16, which is the upstream-intended path for
+            # non-bf16 hardware. including_emulation=False reports native support.
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation=False) else torch.float16
             autocast_context = torch.autocast(device_type="cuda", dtype=amp_dtype)
         else:
             autocast_context = nullcontext()

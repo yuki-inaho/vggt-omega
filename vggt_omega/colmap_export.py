@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import math
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import torch

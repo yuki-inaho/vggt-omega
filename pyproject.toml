@@ -37,6 +37,22 @@ viz = [
     "rerun-sdk>=0.23.1",
 ]
 
+# --- GPU build selection -----------------------------------------------------
+# GTX 1070 is Pascal (compute capability sm_61). NVIDIA CUDA 13.0 removed
+# Maxwell/Pascal/Volta support, so the default PyPI torch wheel (a "+cu130"
+# build) ships no kernels for this GPU and fails with "no kernel image is
+# available for execution on the device". Pull torch/torchvision from the
+# CUDA 12.6 build instead: it still includes Pascal (sm_61) kernels and runs
+# natively on the CUDA-13 driver (580.x) on this box.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+torchvision = [{ index = "pytorch-cu126" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
