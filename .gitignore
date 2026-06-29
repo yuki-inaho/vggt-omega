@@ -10,6 +10,7 @@ htmlcov/
 
 # Local tool/agent state.
 .claude/settings.local.json
+.serena/
 
 # Browser/test artifacts.
 playwright-report/
