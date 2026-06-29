@@ -41,3 +41,6 @@ predictions.npz
 *.pt
 *.pth
 *.safetensors
+
+# Local working/scratch data (sample copies, workdocs).
+temp/
