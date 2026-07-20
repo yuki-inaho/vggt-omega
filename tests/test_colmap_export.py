@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 from vggt_omega.colmap_export import (
     PinholeCamera,
@@ -67,8 +68,6 @@ def test_export_scene_outputs_writes_colmap_text(tmp_path: Path) -> None:
         _fake_scene(),
         image_paths,
         output,
-        PinholeCamera(width=800, height=600, fx=554.0, fy=561.0, cx=401.0, cy=288.0),
-        copy_input_images=True,
     )
 
     assert (output / "predictions.npz").is_file()
@@ -78,6 +77,9 @@ def test_export_scene_outputs_writes_colmap_text(tmp_path: Path) -> None:
     assert (output / "images" / "frame_00001.jpg").is_file()
     assert summary["num_images"] == 2
 
+    with Image.open(output / "images" / "frame_00001.jpg") as image:
+        assert image.size == (8, 8)
+
     images_txt = (output / "sparse" / "0" / "images.txt").read_text(encoding="utf-8")
     assert "1 1 0 0 0 0 0 0 1 frame_00001.jpg" in images_txt
-    assert "frame_00002.jpg" in images_txt
+    assert "2 frame_00002.jpg" in images_txt

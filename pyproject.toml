@@ -3,7 +3,7 @@ name = "vggt-omega"
 version = "0.0.1"
 description = "VGGT-Omega feed-forward camera and depth reconstruction."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 license = {file = "LICENSE"}
 authors = [
     {name = "Jianyuan Wang", email = "jianyuan@robots.ox.ac.uk"},
@@ -18,6 +18,9 @@ dependencies = [
     "torchvision>=0.18",
 ]
 
+[project.scripts]
+vggt-omega = "vggt_omega.cli:main"
+
 [project.optional-dependencies]
 demo = [
     "gradio>=5.17.1",
@@ -29,12 +32,12 @@ demo = [
     "requests",
     "onnxruntime",
 ]
-export = [
-    "pycolmap>=3.10.0",
-]
 viz = [
     "playwright>=1.60.0",
     "rerun-sdk>=0.23.1",
+]
+rgbd = [
+    "matplotlib>=3.7",
 ]
 
 [build-system]
@@ -102,6 +105,7 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "gpu: requires CUDA",
+    "rgbd_smoke: requires CUDA, a VGGT-Omega checkpoint, and a standardized RGB-D session",
     "slow: long-running",
 ]
 

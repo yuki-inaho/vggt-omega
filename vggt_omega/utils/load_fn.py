@@ -5,11 +5,30 @@
 # LICENSE file in the root directory of this source tree.
 
 import warnings
+from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms as TF
+
+
+def load_checkpoint_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
+    """Load a released checkpoint into a normalized model state dictionary."""
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if isinstance(checkpoint, dict):
+        for key in ("model", "state_dict", "module"):
+            candidate = checkpoint.get(key)
+            if isinstance(candidate, dict):
+                checkpoint = candidate
+                break
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Unsupported checkpoint object: {type(checkpoint)!r}")
+    return {key.removeprefix("module."): value for key, value in checkpoint.items()}
 
 
 def load_and_preprocess_images(image_path_list, mode="balanced", image_resolution=512, patch_size=16):
@@ -68,17 +87,14 @@ def _load_rgb_image(image_path):
 def _crop_to_supported_aspect_ratio(image, min_aspect_ratio=0.5, max_aspect_ratio=2.0):
     width, height = image.size
     aspect_ratio = height / max(width, 1)
-
     if aspect_ratio < min_aspect_ratio:
         crop_width = min(width, max(1, int(round(height / min_aspect_ratio))))
         left = max((width - crop_width) // 2, 0)
         return image.crop((left, 0, left + crop_width, height))
-
     if aspect_ratio > max_aspect_ratio:
         crop_height = min(height, max(1, int(round(width * max_aspect_ratio))))
         top = max((height - crop_height) // 2, 0)
         return image.crop((0, top, width, top + crop_height))
-
     return image
 
 

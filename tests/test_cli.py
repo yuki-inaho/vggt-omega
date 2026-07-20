@@ -54,11 +54,6 @@ def test_export_colmap_cli_runs_with_mocked_pipeline(monkeypatch, tmp_path, caps
     images_dir.mkdir()
     for name in ("frame_00001.jpg", "frame_00002.jpg"):
         (images_dir / name).write_bytes(b"dummy")
-    dataset_info = tmp_path / "dataset_info.json"
-    dataset_info.write_text(
-        '{"camera": {"width": 800, "height": 600, "fx": 554.0, "fy": 561.0, "cx": 401.0, "cy": 288.0}}',
-        encoding="utf-8",
-    )
     output = tmp_path / "vggt_export"
 
     monkeypatch.setattr(cli, "VGGTOmegaPipeline", _FakePipeline)
@@ -73,8 +68,6 @@ def test_export_colmap_cli_runs_with_mocked_pipeline(monkeypatch, tmp_path, caps
             str(images_dir),
             "--output",
             str(output),
-            "--dataset-info",
-            str(dataset_info),
             "--device",
             "cpu",
             "--copy-images",

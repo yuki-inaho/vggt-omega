@@ -6,6 +6,7 @@ set shell := ["bash", "-cu"]
 # ---------------------------------------------------------------------------
 
 uv := "uv run --extra demo --extra viz"
+uv_rgbd := "uv run --extra rgbd"
 ckpt_512 := env_var_or_default("VGGT_OMEGA_CKPT", "checkpoints/vggt_omega_1b_512.pt")
 ckpt_256 := env_var_or_default("VGGT_OMEGA_CKPT_256", "checkpoints/vggt_omega_1b_256_text.pt")
 
@@ -63,6 +64,14 @@ demo-text *ARGS:
 # Quick CLI smoke test: extract frames from an example video and run inference.
 smoke ckpt=ckpt_512 video="examples/forest_road.mp4" frames="4":
     {{uv}} python -m vggt_omega.cli smoke --checkpoint {{ckpt}} --video {{video}} --num-frames {{frames}}
+
+# Run one RGB-D chunk with metric scale correction and pose plots.
+rgbd-pose session output ckpt=ckpt_512 *ARGS:
+    {{uv_rgbd}} python run_vggt_rgbd_pose_workflow.py --session-dir {{session}} --checkpoint {{ckpt}} --output-dir {{output}} {{ARGS}}
+
+# Align overlapping RGB-D pose chunks and fuse their masked point clouds.
+rgbd-align session output ckpt=ckpt_512 *ARGS:
+    {{uv_rgbd}} python run_vggt_rgbd_chunk_alignment.py --session-dir {{session}} --checkpoint {{ckpt}} --output-dir {{output}} {{ARGS}}
 
 # ---------------------------------------------------------------------------
 # Rerun visualization recipes.

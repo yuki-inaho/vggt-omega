@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 import math
-import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image
 
 from .pipeline import SceneResult
 from .utils.rotation import mat_to_quat
@@ -113,10 +114,13 @@ def write_colmap_text(
     scene: SceneResult,
     image_names: Sequence[str],
     output_dir: str | Path,
-    camera: PinholeCamera,
 ) -> None:
     if len(image_names) != int(scene.extrinsic.shape[0]):
         raise ValueError(f"image_names count {len(image_names)} does not match scene poses {scene.extrinsic.shape[0]}")
+    if scene.intrinsic.shape != (len(image_names), 3, 3):
+        raise ValueError(f"Expected per-image intrinsics with shape {(len(image_names), 3, 3)}")
+    image_height, image_width = scene.images.shape[-2:]
+    cameras = [camera_from_intrinsics(intrinsic, image_width, image_height) for intrinsic in scene.intrinsic]
 
     sparse_dir = Path(output_dir)
     sparse_dir.mkdir(parents=True, exist_ok=True)
@@ -124,12 +128,13 @@ def write_colmap_text(
     with (sparse_dir / "cameras.txt").open("w", encoding="utf-8") as f:
         f.write("# Camera list with one line of data per camera:\n")
         f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-        f.write("# Number of cameras: 1\n")
-        f.write(
-            "1 PINHOLE "
-            f"{camera.width} {camera.height} "
-            f"{camera.fx:.12g} {camera.fy:.12g} {camera.cx:.12g} {camera.cy:.12g}\n"
-        )
+        f.write(f"# Number of cameras: {len(cameras)}\n")
+        for camera_id, camera in enumerate(cameras, start=1):
+            f.write(
+                f"{camera_id} PINHOLE "
+                f"{camera.width} {camera.height} "
+                f"{camera.fx:.12g} {camera.fy:.12g} {camera.cx:.12g} {camera.cy:.12g}\n"
+            )
 
     with (sparse_dir / "images.txt").open("w", encoding="utf-8") as f:
         f.write("# Image list with two lines of data per image:\n")
@@ -143,7 +148,7 @@ def write_colmap_text(
                 f"{image_id} "
                 f"{qvec[0]:.17g} {qvec[1]:.17g} {qvec[2]:.17g} {qvec[3]:.17g} "
                 f"{tvec[0]:.17g} {tvec[1]:.17g} {tvec[2]:.17g} "
-                f"1 {name}\n"
+                f"{image_id} {name}\n"
             )
             f.write("\n")
 
@@ -153,19 +158,26 @@ def write_colmap_text(
         f.write("# Number of points: 0, mean track length: 0\n")
 
 
-def copy_images(image_paths: Sequence[Path], output_images_dir: str | Path) -> None:
+def write_processed_images(scene: SceneResult, image_paths: Sequence[Path], output_images_dir: str | Path) -> None:
+    """Write the model-grid images referenced by the COLMAP text model."""
+    images = scene.images.detach().cpu() if isinstance(scene.images, torch.Tensor) else torch.as_tensor(scene.images)
+    if images.ndim == 3:
+        images = images.unsqueeze(0)
+    if images.ndim != 4 or images.shape[0] != len(image_paths) or images.shape[1] != 3:
+        raise ValueError("Scene images must have shape (N, 3, H, W) matching image_paths")
     dst_root = Path(output_images_dir)
     dst_root.mkdir(parents=True, exist_ok=True)
-    for path in image_paths:
-        shutil.copy2(path, dst_root / path.name)
+    for image, path in zip(images, image_paths, strict=True):
+        array = image.permute(1, 2, 0).numpy()
+        array = np.clip(np.rint(array * 255.0), 0, 255).astype(np.uint8)
+        Image.fromarray(array, mode="RGB").save(dst_root / path.name)
 
 
 def export_scene_outputs(
     scene: SceneResult,
     image_paths: Sequence[Path],
     output_root: str | Path,
-    camera: PinholeCamera,
-    copy_input_images: bool = False,
+    copy_processed_images: bool = True,
     run_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output = Path(output_root)
@@ -174,22 +186,21 @@ def export_scene_outputs(
 
     npz_path = output / "predictions.npz"
     np.savez_compressed(npz_path, **scene.as_npz_dict())
-    write_colmap_text(scene, [p.name for p in image_paths], sparse_dir, camera)
-    if copy_input_images:
-        copy_images(image_paths, output / "images")
+    write_colmap_text(scene, [p.name for p in image_paths], sparse_dir)
+    if copy_processed_images:
+        write_processed_images(scene, image_paths, output / "images")
 
     pose_summary = validate_scene_pose(scene, len(image_paths))
     summary = {
         "created_at": utc_now(),
         "num_images": len(image_paths),
         "image_names": [p.name for p in image_paths],
-        "camera": camera.__dict__,
         "run_settings": run_settings or {},
         "paths": {
             "output_root": str(output),
             "predictions_npz": str(npz_path),
             "sparse_dir": str(sparse_dir),
-            "images_dir": str(output / "images") if copy_input_images else None,
+            "images_dir": str(output / "images") if copy_processed_images else None,
         },
         "pose_summary": pose_summary,
     }

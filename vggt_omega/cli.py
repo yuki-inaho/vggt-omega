@@ -9,10 +9,8 @@ from pathlib import Path
 import torch
 
 from .colmap_export import (
-    camera_from_intrinsics,
     collect_image_paths,
     export_scene_outputs,
-    load_camera_from_dataset_info,
 )
 from .pipeline import VGGTOmegaPipeline
 from .preprocess import load_images_from_paths, preprocess_images, read_images_from_video
@@ -62,22 +60,16 @@ def _cmd_export_colmap(args: argparse.Namespace) -> int:
     images = load_images_from_paths(image_paths, image_resolution=args.image_resolution)
     scene = pipeline.run(images).with_world_points()
 
-    if args.dataset_info:
-        camera = load_camera_from_dataset_info(args.dataset_info)
-    else:
-        first_intrinsic = scene.intrinsic[0]
-        camera = camera_from_intrinsics(first_intrinsic, width=images.shape[-1], height=images.shape[-2])
-
     summary = export_scene_outputs(
         scene,
         image_paths,
         args.output,
-        camera,
-        copy_input_images=args.copy_images,
+        copy_processed_images=args.copy_images,
         run_settings={
             "checkpoint": str(args.checkpoint),
             "image_resolution": int(args.image_resolution),
-            "dataset_info": str(args.dataset_info) if args.dataset_info else None,
+            "preprocess_mode": "balanced",
+            "patch_size": 16,
             "device": str(args.device) if args.device else None,
             "enable_alignment": bool(args.enable_alignment),
             "copy_images": bool(args.copy_images),
@@ -114,12 +106,16 @@ def _build_parser() -> argparse.ArgumentParser:
     export.add_argument("--checkpoint", required=True, help="Path to a VGGT-Omega .pt checkpoint")
     export.add_argument("--images", required=True, help="Directory of input images")
     export.add_argument("--output", required=True, help="Output root for predictions.npz and sparse/0/*.txt")
-    export.add_argument("--dataset-info", help="Optional dataset_info.json with original RGB camera intrinsics")
     export.add_argument("--num-frames", type=int, default=0, help="Limit number of frames; 0 means all")
     export.add_argument("--image-resolution", type=int, default=512)
     export.add_argument("--device", help="Torch device, e.g. cuda, cuda:0, or cpu")
     export.add_argument("--enable-alignment", action="store_true", help="Enable the text-alignment head")
-    export.add_argument("--copy-images", action="store_true", help="Copy input images under <output>/images")
+    export.add_argument(
+        "--copy-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write model-grid images under <output>/images (default: enabled)",
+    )
     export.set_defaults(func=_cmd_export_colmap)
     return parser
 
