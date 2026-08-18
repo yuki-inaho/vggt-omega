@@ -35,6 +35,17 @@ Before using the models, please request access to the checkpoints [here](https:/
 The authors are not involved in the review process and cannot approve or reject individual applications. However, the [🤗 Hugging Face demo](https://huggingface.co/spaces/facebook/vggt-omega) is available to everyone.
 
 
+## Notice
+
+*August 18, 2026*
+
+We recently became aware of an issue that may have caused benchmark contamination in an ancestor checkpoint of the released 1B model. As a result, the performance of the released 1B model as reported in Table 1 and 2 (1B row) may be inflated.
+
+The model works correctly and it can continue to be used for downstream applications unrelated to these benchmarks. However, if you do use the model, or a derivative of it, to assess performance on these benchmarks, please do not rely on them until we conclude our investigation.
+
+We apologise for the mistake and the disruption caused by it.
+
+
 ## Quick Start
 
 First, clone this repository and install the dependencies:
