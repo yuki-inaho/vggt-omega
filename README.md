@@ -35,7 +35,7 @@ Before using the models, please request access to the checkpoints [here](https:/
 The authors are not involved in the review process and cannot approve or reject individual applications. However, the [🤗 Hugging Face demo](https://huggingface.co/spaces/facebook/vggt-omega) is available to everyone.
 
 
-## Notice
+## Important Notice
 
 *August 18, 2026*
 
