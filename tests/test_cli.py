@@ -47,3 +47,35 @@ def test_smoke_cli_runs_video_path_with_mocked_pipeline(monkeypatch, capsys) -> 
 
     assert code == 0
     assert "smoke ok" in capsys.readouterr().out
+
+
+def test_export_colmap_cli_runs_with_mocked_pipeline(monkeypatch, tmp_path, capsys) -> None:
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    for name in ("frame_00001.jpg", "frame_00002.jpg"):
+        (images_dir / name).write_bytes(b"dummy")
+    output = tmp_path / "vggt_export"
+
+    monkeypatch.setattr(cli, "VGGTOmegaPipeline", _FakePipeline)
+    monkeypatch.setattr(cli, "load_images_from_paths", lambda *args, **kwargs: torch.zeros(2, 3, 8, 8))
+
+    code = cli.main(
+        [
+            "export-colmap",
+            "--checkpoint",
+            "dummy.pt",
+            "--images",
+            str(images_dir),
+            "--output",
+            str(output),
+            "--device",
+            "cpu",
+            "--copy-images",
+        ]
+    )
+
+    assert code == 0
+    assert "export-colmap ok" in capsys.readouterr().out
+    assert (output / "predictions.npz").is_file()
+    assert (output / "sparse" / "0" / "cameras.txt").is_file()
+    assert (output / "sparse" / "0" / "images.txt").is_file()

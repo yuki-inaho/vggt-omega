@@ -122,6 +122,28 @@ with the default `mode="balanced"` and `image_resolution=512`. For these roughly
 `mode="max_size"` to resize the longest side to 512 instead; for the same aspect
 ratio, this gives about 512x336 inputs and uses less GPU memory.
 
+## RGB-D metric-pose workflow
+
+For standardized robot RGB-D sessions, the native PyTorch BF16 workflow uses
+RGB depth to estimate one robust metric scale per VGGT chunk, then chains
+overlapping chunks into an initial global alignment and fuses masked point
+clouds. See [the RGB-D pose workflow](./docs/RGBD_POSE_WORKFLOW.md).
+
+## COLMAP-compatible export
+
+```bash
+vggt-omega export-colmap \
+  --checkpoint checkpoints/vggt_omega_1b_512.pt \
+  --images /path/to/input_images \
+  --output outputs/omega_export
+```
+
+The command writes predicted poses, intrinsics, and depth to
+`predictions.npz`, COLMAP-compatible text under `sparse/0/`, and the exact
+model-grid RGB frames under `images/`. The text model references those exported
+frames, so its camera sizes and intrinsics are consistent. This is an output
+bridge only: VGGT-Omega neither installs nor invokes COLMAP.
+
 ## License
 
 See the [LICENSE](./LICENSE) file for details about the license under which
