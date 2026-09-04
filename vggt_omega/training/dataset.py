@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from itertools import combinations
+from itertools import combinations, pairwise
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +120,8 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
         overlap_end_target: float = 0.5,
         overlap_target_tolerance: float = 0.05,
         overlap_curriculum_epochs: int = 1,
+        filter_short_sequences: bool = False,
+        flow_teacher_manifest: str | Path | None = None,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -133,6 +135,8 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
         self.overlap_end_target = float(overlap_end_target)
         self.overlap_target_tolerance = float(overlap_target_tolerance)
         self.overlap_curriculum_epochs = int(overlap_curriculum_epochs)
+        self.filter_short_sequences = bool(filter_short_sequences)
+        self.flow_teacher_template: str | None = None
         self.epoch = 0
         if split not in {"train", "val", "smoke"}:
             raise DataContractError("split must be one of train, val, or smoke")
@@ -154,8 +158,39 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
             metadata = json.loads((self.root / "dataset.json").read_text())
         except (OSError, ValueError) as error:
             raise DataContractError("dataset.json is missing or invalid") from error
-        if metadata.get("format") != "colmap_rgbd_v1":
-            raise DataContractError("dataset format is not colmap_rgbd_v1")
+        self.dataset_format = str(metadata.get("format"))
+        if self.dataset_format not in {"colmap_rgbd_v1", "colmap_rgbd_v2"}:
+            raise DataContractError("dataset format is not a supported colmap_rgbd version")
+        self.has_original_depth_observed = self.dataset_format == "colmap_rgbd_v2"
+        if self.has_original_depth_observed:
+            observed_metadata = metadata.get("original_depth_observed")
+            if observed_metadata != {
+                "directory": "original_depth_observed",
+                "dtype": "uint8",
+                "false_value": 0,
+                "meaning": "pre_dilation_sensor_observation",
+                "true_value": 255,
+            }:
+                raise DataContractError("v2 original-depth-observed metadata is missing or invalid")
+        if flow_teacher_manifest is not None:
+            manifest_path = Path(flow_teacher_manifest)
+            if manifest_path.is_absolute() or ".." in manifest_path.parts:
+                raise DataContractError("flow teacher manifest must be a safe relative path")
+            try:
+                flow_metadata = json.loads((self.root / manifest_path).read_text())
+            except (OSError, ValueError) as error:
+                raise DataContractError("flow teacher manifest is missing or invalid") from error
+            expected_flow_metadata = {
+                "coordinate_space": "pixel_displacement_xy",
+                "file_template": "scenes/{scene_id}/flow_teacher/pair_{source_id:06d}_{target_id:06d}.npz",
+                "flow_dtype": "float32",
+                "format": "dynamic_flow_teacher_v1",
+                "occlusion_dtype": "int8_tri_state",
+                "schema_version": 1,
+            }
+            if flow_metadata != expected_flow_metadata:
+                raise DataContractError("flow teacher manifest violates the explicit schema")
+            self.flow_teacher_template = str(flow_metadata["file_template"])
         self.height = int(metadata.get("image", {}).get("height", 0))
         self.width = int(metadata.get("image", {}).get("width", 0))
         if (
@@ -238,11 +273,22 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
                 raise DataContractError("split entry is not a generic relative sequence name")
             entries.append((match.group(1), int(match.group(2))))
         self.entries = entries
+        self._scenes: dict[str, dict[str, np.ndarray]] = {}
         for scene_name in {scene_name for scene_name, _ in entries}:
             overlap_path = self.root / "scenes" / scene_name / str(self.overlap_metadata["filename"])
             if overlap_path.is_symlink() or not overlap_path.is_file():
                 raise DataContractError("overlap profile file is missing or is not a regular file")
-        self._scenes: dict[str, dict[str, np.ndarray]] = {}
+        if self.filter_short_sequences:
+            eligible: list[tuple[str, int]] = []
+            for scene_name, sequence_id in self.entries:
+                scene = self._load_scene(scene_name)
+                if not 0 <= sequence_id < len(scene["sequence_lengths"]):
+                    raise DataContractError(f"sequence index {sequence_id} is out of range")
+                if int(scene["sequence_lengths"][sequence_id]) >= self.min_frames:
+                    eligible.append((scene_name, sequence_id))
+            if not eligible:
+                raise DataContractError("split contains no sequence long enough for the requested frame count")
+            self.entries = eligible
 
     def set_epoch(self, epoch: int) -> None:
         """Change deterministic sampling without relying on process-global RNG state."""
@@ -390,13 +436,17 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
         self._scenes[scene_name] = scene
         return scene
 
-    def _load_pixels(self, scene_name: str, frame_ids: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    def _load_pixels(
+        self, scene_name: str, frame_ids: np.ndarray
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         rgb_frames: list[np.ndarray] = []
         depth_frames: list[np.ndarray] = []
+        observed_frames: list[np.ndarray] = []
         for frame_id in frame_ids:
             filename = f"frame_{int(frame_id):06d}.png"
             rgb_path = self.root / "scenes" / scene_name / "rgb" / filename
             depth_path = self.root / "scenes" / scene_name / "depth" / filename
+            observed_path = self.root / "scenes" / scene_name / "original_depth_observed" / filename
             if rgb_path.is_symlink() or depth_path.is_symlink() or not rgb_path.is_file() or not depth_path.is_file():
                 raise DataContractError("RGB and depth frames must be regular files, not symlinks")
             try:
@@ -408,12 +458,28 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
                     if image.info:
                         raise DataContractError("depth frame metadata violates the staging contract")
                     depth = np.array(image, copy=True)
+                if self.has_original_depth_observed:
+                    if observed_path.is_symlink() or not observed_path.is_file():
+                        raise DataContractError("v2 original-depth-observed mask must be a regular file")
+                    with Image.open(observed_path) as image:
+                        if image.info:
+                            raise DataContractError("original-depth-observed metadata violates the staging contract")
+                        observed = np.array(image, copy=True)
             except (OSError, ValueError, DataContractError) as error:
                 raise DataContractError(f"generic frame {int(frame_id)} cannot be decoded") from error
             if rgb.shape != (self.height, self.width, 3) or rgb.dtype != np.uint8:
                 raise DataContractError(f"generic RGB frame {int(frame_id)} has invalid shape or dtype")
             if depth.shape != (self.height, self.width) or depth.dtype != np.uint16:
                 raise DataContractError(f"generic depth frame {int(frame_id)} has invalid shape or dtype")
+            if self.has_original_depth_observed:
+                if (
+                    observed.shape != (self.height, self.width)
+                    or observed.dtype != np.uint8
+                    or not np.isin(observed, (0, 255)).all()
+                    or np.any((observed == 255) & (depth == 0))
+                ):
+                    raise DataContractError("original-depth-observed mask violates the v2 pixel contract")
+                observed_frames.append(observed == 255)
             if int(depth.max(initial=0)) > self.max_depth_mm:
                 raise DataContractError(f"generic depth frame {int(frame_id)} exceeds max_depth_mm")
             valid_count = int(np.count_nonzero(depth))
@@ -425,7 +491,8 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
             depth_frames.append(depth)
         images = torch.from_numpy(np.stack(rgb_frames)).permute(0, 3, 1, 2).float().div_(255)
         depths = torch.from_numpy(np.stack(depth_frames).astype(np.float32)).div_(1000)
-        return images, depths
+        observed_masks = torch.from_numpy(np.stack(observed_frames)) if self.has_original_depth_observed else None
+        return images, depths, observed_masks
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         if not 0 <= index < len(self.entries):
@@ -483,7 +550,7 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
         if not np.all(scene["chunk_ids"][selected] == expected_chunk):
             raise DataContractError("stored sequence crosses a trajectory chunk boundary")
 
-        images, metric_depths = self._load_pixels(scene_name, selected)
+        images, metric_depths, original_observed = self._load_pixels(scene_name, selected)
         depth_masks = metric_depths > 0
         intrinsics = torch.from_numpy(scene["intrinsics"][selected].astype(np.float32, copy=True))
         extrinsics = torch.from_numpy(scene["extrinsics_w2c"][selected].astype(np.float32, copy=True))
@@ -491,7 +558,7 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
             geometry = normalize_supervision(metric_depths, depth_masks, intrinsics, extrinsics)
         except GeometryContractError as error:
             raise DataContractError(f"dense geometry failed for sequence {sequence_id}: {error}") from error
-        return {
+        result = {
             "images": images,
             "depths": geometry["depths"],
             "depth_masks": geometry["depth_masks"],
@@ -504,4 +571,60 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
             "scene_id": scene_name,
             "sequence_id": sequence_id,
             **sampling_metrics,
+        }
+        if original_observed is not None:
+            result["original_depth_observed_mask"] = original_observed
+        if self.flow_teacher_template is not None:
+            result.update(self._load_flow_teacher(scene_name, selected))
+        return result
+
+    def _load_flow_teacher(self, scene_name: str, selected: np.ndarray) -> dict[str, torch.Tensor]:
+        ordered_positions = np.argsort(selected, kind="stable")
+        pair_positions: list[tuple[int, int]] = []
+        for left, right in pairwise(ordered_positions):
+            pair_positions.extend(((int(left), int(right)), (int(right), int(left))))
+        flows: list[np.ndarray] = []
+        confidences: list[np.ndarray] = []
+        occlusions: list[np.ndarray] = []
+        assert self.flow_teacher_template is not None
+        for source_position, target_position in pair_positions:
+            source_id = int(selected[source_position])
+            target_id = int(selected[target_position])
+            relative = self.flow_teacher_template.format(
+                scene_id=scene_name,
+                source_id=source_id,
+                target_id=target_id,
+            )
+            path = self.root / relative
+            if path.is_symlink() or not path.is_file():
+                raise DataContractError("directed flow teacher pair is missing or is not a regular file")
+            try:
+                with np.load(path, allow_pickle=False) as payload:
+                    if set(payload.files) != {"confidence", "flow_xy", "occlusion_label"}:
+                        raise ValueError("unexpected flow teacher arrays")
+                    flow = payload["flow_xy"].copy()
+                    confidence = payload["confidence"].copy()
+                    occlusion = payload["occlusion_label"].copy()
+            except (OSError, ValueError) as error:
+                raise DataContractError("directed flow teacher pair is invalid") from error
+            if (
+                flow.shape != (self.height, self.width, 2)
+                or flow.dtype != np.float32
+                or confidence.shape != (self.height, self.width)
+                or confidence.dtype != np.float32
+                or occlusion.shape != (self.height, self.width)
+                or occlusion.dtype != np.int8
+                or not np.isfinite(flow).all()
+                or not np.isfinite(confidence).all()
+                or ((confidence < 0) | (confidence > 1)).any()
+                or not np.isin(occlusion, (-1, 0, 1)).all()
+            ):
+                raise DataContractError("directed flow teacher arrays violate shape, dtype, or range")
+            flows.append(flow)
+            confidences.append(confidence)
+            occlusions.append(occlusion)
+        return {
+            "motion_pixel_flow_xy": torch.from_numpy(np.stack(flows)),
+            "motion_flow_confidence": torch.from_numpy(np.stack(confidences)),
+            "motion_flow_occlusion_label": torch.from_numpy(np.stack(occlusions)),
         }

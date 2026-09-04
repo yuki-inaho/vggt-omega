@@ -18,7 +18,12 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from vggt_omega.training.dataset import ColmapRgbdDataset
-from vggt_omega.training.model_factory import PreparedTrainingModel, build_training_model
+from vggt_omega.training.model_factory import (
+    PreparedTrainingModel,
+    attach_dynamic_geometry_model,
+    attach_pixel_depth_model,
+    build_training_model,
+)
 from vggt_omega.training.runner import _renderer_options, validate_one_epoch
 
 ModelFactory = Callable[..., PreparedTrainingModel]
@@ -39,6 +44,7 @@ _MONITOR_TO_METRIC = {
     "val/rpa_5": "rpa_5",
     "val/rpa_15": "rpa_15",
     "val/rpa_30": "rpa_30",
+    "val/near_edge_objective": "near_edge_objective",
 }
 _LOSS_WEIGHT_KEYS = (
     "camera_weight",
@@ -207,7 +213,16 @@ def _validate_completed_summary(
     stopped_early = summary.get("stopped_early", False)
     if not isinstance(stopped_early, bool):
         raise EvaluationError("summary stopped_early must be boolean")
-    if (not stopped_early and completed_epochs != configured_epochs) or (
+    raw_max_train_steps = trainer.get("max_train_steps")
+    max_train_steps = (
+        None if raw_max_train_steps is None else _positive_int(raw_max_train_steps, "configured max_train_steps")
+    )
+    if max_train_steps is not None and global_step > max_train_steps:
+        raise EvaluationError("summary global_step exceeds configured max_train_steps")
+    completed_by_step_limit = (
+        max_train_steps is not None and global_step == max_train_steps and 0 < completed_epochs <= configured_epochs
+    )
+    if (not stopped_early and completed_epochs != configured_epochs and not completed_by_step_limit) or (
         stopped_early and not 0 < completed_epochs <= configured_epochs
     ):
         raise EvaluationError("run summary does not cover the expected configured epochs")
@@ -546,14 +561,29 @@ def _validation_dataset(
         data.get("min_valid_depth_pixels"),
         "data.min_valid_depth_pixels",
     )
-    dataset = dataset_factory(
-        data_root,
-        split=split,
-        min_frames=min_frames,
-        max_frames=max_frames,
-        seed=seed,
-        min_valid_depth_pixels=min_valid_depth_pixels,
-    )
+    dataset_options: dict[str, Any] = {
+        "split": split,
+        "min_frames": min_frames,
+        "max_frames": max_frames,
+        "filter_short_sequences": min_frames == max_frames,
+        "seed": seed,
+        "min_valid_depth_pixels": min_valid_depth_pixels,
+    }
+    dynamic_config = config.get("dynamic_geometry")
+    if isinstance(dynamic_config, Mapping) and dynamic_config.get("enabled") is True:
+        pseudo_labels = dynamic_config.get("pseudo_labels")
+        if not isinstance(pseudo_labels, Mapping):
+            raise EvaluationError("dynamic geometry requires pseudo_labels")
+        manifest = pseudo_labels.get("teacher_artifact_manifest")
+        if (
+            not isinstance(manifest, str)
+            or not manifest
+            or Path(manifest).is_absolute()
+            or ".." in Path(manifest).parts
+        ):
+            raise EvaluationError("dynamic flow teacher manifest must be a safe relative path")
+        dataset_options["flow_teacher_manifest"] = manifest
+    dataset = dataset_factory(data_root, **dataset_options)
     if len(dataset) < 1:
         raise EvaluationError("validation dataset must not be empty")
     set_epoch = getattr(dataset, "set_epoch", None)
@@ -739,6 +769,11 @@ def evaluate_training_checkpoints(
 
     selected_model_factory = model_factory or build_training_model
     prepared = selected_model_factory(base_checkpoint, device=runtime_device)
+    prepared, pixel_config, pixel_enabled = _attach_configured_training_wrappers(
+        prepared,
+        resolved_config,
+        device=runtime_device,
+    )
     model = prepared.model
     if not isinstance(model, nn.Module):
         raise EvaluationError("model factory did not return a torch module")
@@ -797,6 +832,21 @@ def evaluate_training_checkpoints(
                 loss_options=validation_loss_options,
                 renderer_options=validation_renderer_options,
                 depth_thresholds_m=validated_thresholds_m,
+                pixel_depth_options=(
+                    {
+                        **dict(cast(Mapping[str, object], pixel_config["flow"])),
+                        "max_depth_m": float(cast(Mapping[str, object], pixel_config["geometry"])["max_depth_m"]),
+                    }
+                    if pixel_enabled and isinstance(pixel_config, Mapping)
+                    else None
+                ),
+                flow_generator=(
+                    torch.Generator(device=runtime_device).manual_seed(
+                        seed + int(cast(Mapping[str, object], pixel_config["flow"])["seed_offset"]) + 1
+                    )
+                    if pixel_enabled and isinstance(pixel_config, Mapping)
+                    else None
+                ),
             )
         )
         if metric_key not in metrics:
@@ -836,3 +886,25 @@ def evaluate_training_checkpoints(
     }
     _atomic_json(report, Path(output_path).expanduser().resolve())
     return report
+
+
+def _attach_configured_training_wrappers(
+    prepared: PreparedTrainingModel,
+    resolved_config: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> tuple[PreparedTrainingModel, object, bool]:
+    """Rebuild training wrappers in the same base→pixel→dynamic order as the runner."""
+
+    pixel_config = resolved_config.get("pixel_depth")
+    pixel_enabled = isinstance(pixel_config, Mapping) and pixel_config.get("enabled") is True
+    if pixel_enabled:
+        prepared = attach_pixel_depth_model(prepared, cast(Mapping[str, object], pixel_config), device=device)
+    dynamic_config = resolved_config.get("dynamic_geometry")
+    if isinstance(dynamic_config, Mapping) and dynamic_config.get("enabled") is True:
+        prepared = attach_dynamic_geometry_model(
+            prepared,
+            cast(Mapping[str, object], dynamic_config),
+            device=device,
+        )
+    return prepared, pixel_config, pixel_enabled

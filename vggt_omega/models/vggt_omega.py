@@ -33,7 +33,18 @@ class VGGTOmega(nn.Module):
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        return_patch_features: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Predict camera/depth and optionally expose final multi-frame patch features.
+
+        ``return_patch_features`` is an opt-in training interface.  Keeping it
+        disabled preserves the released inference output contract and state
+        dictionary exactly.
+        """
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
 
@@ -53,6 +64,29 @@ class VGGTOmega(nn.Module):
         predictions = {
             "camera_and_register_tokens": final_tokens[:, :, :patch_token_start].contiguous(),
         }
+        if return_patch_features:
+            patch_size = getattr(self.aggregator, "patch_size", None)
+            if not isinstance(patch_size, int) or patch_size <= 0:
+                raise ValueError("aggregator.patch_size must be a positive integer when returning patch features")
+            patch_grid_hw = (int(images.shape[-2]) // patch_size, int(images.shape[-1]) // patch_size)
+            patch_features = final_tokens[:, :, patch_token_start:].contiguous()
+            expected_patch_count = patch_grid_hw[0] * patch_grid_hw[1]
+            if patch_features.shape[2] != expected_patch_count:
+                raise ValueError(
+                    "Aggregator patch-token count does not match the input grid: "
+                    f"tokens={patch_features.shape[2]}, grid={patch_grid_hw}"
+                )
+            predictions["patch_features"] = patch_features
+            predictions["patch_grid_hw"] = torch.tensor(
+                patch_grid_hw,
+                device=patch_features.device,
+                dtype=torch.int64,
+            )
+            predictions["patch_valid_mask"] = torch.ones(
+                patch_features.shape[:3],
+                device=patch_features.device,
+                dtype=torch.bool,
+            )
         with torch.autocast(device_type="cuda", enabled=False):
             if self.camera_head is not None:
                 predictions["pose_enc"] = self.camera_head(

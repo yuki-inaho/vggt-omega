@@ -145,6 +145,23 @@ configuration. Keep the same `model.initial_head_checkpoint` value when
 resuming so the persisted configuration and initialization provenance remain
 identical; the resume state then replaces those initially loaded head weights.
 
+### Training performance profiles
+
+Training uses the eager `performance=default` profile. It enables first-batch
+RGB-D tensor contracts and applies worker prefetch/persistence only when
+`data.num_workers>0`. The optional `performance=profiled_compile` profile
+records anonymous warmup, step-time, throughput, and loader-wait scalars while
+compiling only the explicitly listed refinement modules.
+
+Compile errors, graph breaks promoted to errors, OOMs, and numerical failures
+are not silently hidden by an eager fallback. Re-run the same resolved training
+configuration with `performance=default` to make the rollback explicit. Change
+DataLoader tuning one variable at a time (`data.num_workers`, then
+`performance.data_loader.prefetch_factor`, then `persistent_workers`) and keep
+the eager profile unless the same-shape benchmark demonstrates parity and a
+speedup. Runtime typing remains limited to the new public RGB-D training batch
+boundary; it is not injected into the upstream backbone.
+
 ## Runtime and GPU Memory
 
 We benchmark the end-to-end peak GPU memory usage of `VGGT-Omega-1B-512` on a

@@ -25,9 +25,10 @@ from PIL import Image
 from vggt_omega.training.overlap import bidirectional_rgbd_overlap
 
 DATASET_FORMAT = "colmap_rgbd_v1"
+DATASET_FORMAT_V2 = "colmap_rgbd_v2"
 SCENE_NAME = "scene_000000"
 SPLIT_NAMES = ("train", "val", "smoke")
-_SCENE_FILE = re.compile(r"scenes/scene_\d{6}/(?:rgb|depth)/frame_\d{6}\.png$")
+_SCENE_FILE = re.compile(r"scenes/scene_\d{6}/(?:rgb|depth|original_depth_observed)/frame_\d{6}\.png$")
 _SCENE_ARRAY = re.compile(r"scenes/scene_\d{6}/(?:cameras|sequences|overlap)\.npz$")
 _SPLIT_FILE = re.compile(r"splits/(?:train|val|smoke)\.txt$")
 _SEQUENCE_ENTRY = re.compile(r"scene_\d{6}/sequence_(\d{6})$")
@@ -443,7 +444,10 @@ def _allowed_relative_path(relative: str, is_directory: bool) -> bool:
     if not is_directory:
         return False
     return bool(
-        re.fullmatch(r"(?:scenes|splits|reports|scenes/scene_\d{6}|scenes/scene_\d{6}/(?:rgb|depth))", relative)
+        re.fullmatch(
+            r"(?:scenes|splits|reports|scenes/scene_\d{6}|scenes/scene_\d{6}/(?:rgb|depth|original_depth_observed))",
+            relative,
+        )
     )
 
 
@@ -628,13 +632,19 @@ def _validate_png_contract(
     width: int,
     height: int,
     max_depth_mm: int,
+    require_original_observed: bool = False,
 ) -> int:
     violations = 0
     expected_names = {f"frame_{index:06d}.png" for index in range(frame_count)}
     scene_root = root / "scenes" / SCENE_NAME
     rgb_paths = list((scene_root / "rgb").glob("frame_*.png"))
     depth_paths = list((scene_root / "depth").glob("frame_*.png"))
+    observed_paths = list((scene_root / "original_depth_observed").glob("frame_*.png"))
     if {path.name for path in rgb_paths} != expected_names or {path.name for path in depth_paths} != expected_names:
+        violations += 1
+    if require_original_observed and {path.name for path in observed_paths} != expected_names:
+        violations += 1
+    if not require_original_observed and observed_paths:
         violations += 1
     for path in rgb_paths:
         try:
@@ -660,6 +670,24 @@ def _validate_png_contract(
                 raise ValueError("invalid depth pixels")
             if not np.any(depth) or int(depth.max(initial=0)) > max_depth_mm:
                 raise ValueError("depth is empty or exceeds the configured limit")
+        except Exception:
+            violations += 1
+    for path in observed_paths:
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("not a regular original-observation file")
+            with Image.open(path) as image:
+                observed = np.asarray(image)
+                if image.size != (width, height) or image.info:
+                    raise ValueError("invalid original-observation metadata")
+            depth = np.asarray(Image.open(scene_root / "depth" / path.name))
+            if (
+                observed.shape != (height, width)
+                or observed.dtype != np.uint8
+                or not np.isin(observed, (0, 255)).all()
+                or np.any((observed == 255) & (depth == 0))
+            ):
+                raise ValueError("invalid original-observation pixels")
         except Exception:
             violations += 1
     return violations
@@ -720,7 +748,7 @@ def validate_staging(
         dataset = json.loads(dataset_path.read_text())
         if not isinstance(dataset, Mapping):
             raise ValueError("dataset metadata must be an object")
-        if set(dataset) != {
+        required_dataset_fields = {
             "schema_version",
             "format",
             "scene_count",
@@ -731,7 +759,11 @@ def validate_staging(
             "sequences",
             "overlap",
             "splits",
-        }:
+        }
+        is_v2 = dataset.get("format") == DATASET_FORMAT_V2
+        if is_v2:
+            required_dataset_fields.add("original_depth_observed")
+        if set(dataset) != required_dataset_fields:
             raise ValueError("dataset metadata contains unexpected fields")
         image_metadata = dataset["image"]
         depth_metadata = dataset["depth"]
@@ -739,6 +771,7 @@ def validate_staging(
         sequence_metadata = dataset["sequences"]
         overlap_metadata = dataset["overlap"]
         split_metadata = dataset["splits"]
+        observed_metadata = dataset.get("original_depth_observed")
         if (
             set(image_metadata) != {"height", "width", "channels", "dtype"}
             or set(depth_metadata)
@@ -846,8 +879,8 @@ def validate_staging(
             and np.allclose(np.linalg.det(rotations), 1.0, atol=1e-4)
         )
         metadata_ok = bool(
-            dataset.get("schema_version") == 1
-            and dataset.get("format") == DATASET_FORMAT
+            dataset.get("schema_version") == (2 if is_v2 else 1)
+            and dataset.get("format") == (DATASET_FORMAT_V2 if is_v2 else DATASET_FORMAT)
             and dataset.get("scene_count") == 1
             and frame_count > 0
             and width > 0
@@ -879,6 +912,17 @@ def validate_staging(
             and math.isfinite(float(overlap_metadata.get("near_depth_m", 0)))
             and float(overlap_metadata.get("near_depth_m", 0)) > 0
             and overlap_arrays_ok
+            and (
+                not is_v2
+                or observed_metadata
+                == {
+                    "directory": "original_depth_observed",
+                    "dtype": "uint8",
+                    "false_value": 0,
+                    "meaning": "pre_dilation_sensor_observation",
+                    "true_value": 255,
+                }
+            )
         )
         frame_contract_violation_count = _validate_png_contract(
             root,
@@ -886,6 +930,7 @@ def validate_staging(
             width=width,
             height=height,
             max_depth_mm=max_depth_mm,
+            require_original_observed=is_v2,
         )
         scene_dir = root / "scenes"
         scene_names = {path.name for path in scene_dir.iterdir() if path.is_dir() and not path.is_symlink()}
@@ -948,6 +993,7 @@ def export_colmap_rgbd_training(
     max_rotation_deg: float = 3.0,
     guard_frames: int = 12,
     split_fractions: tuple[float, float, float] = (0.8, 0.15, 0.05),
+    original_depth_observed_root: Path | None = None,
 ) -> dict[str, Any]:
     """Create one anonymous scene from a private RGB-D sequence and aligned poses."""
 
@@ -955,6 +1001,7 @@ def export_colmap_rgbd_training(
     trajectory_path = Path(trajectory_path)
     rgb_camera_yaml = Path(rgb_camera_yaml)
     output_root = Path(output_root)
+    original_depth_observed_root = None if original_depth_observed_root is None else Path(original_depth_observed_root)
     if output_root.is_symlink():
         raise ExportContractError("output_root must not be a symlink")
     if output_root.exists() and any(output_root.iterdir()):
@@ -984,6 +1031,12 @@ def export_colmap_rgbd_training(
         or set(rgb_by_key) != set(depth_by_key)
     ):
         raise ExportContractError("RGB and mapped-depth stems do not have a one-to-one match")
+    observed_by_key: dict[str, Path] = {}
+    if original_depth_observed_root is not None:
+        observed_paths = sorted(original_depth_observed_root.glob("*.png"))
+        observed_by_key = {_pair_key(path, "depth"): path for path in observed_paths}
+        if len(observed_by_key) != len(observed_paths) or set(observed_by_key) != set(depth_by_key):
+            raise ExportContractError("original-observation masks must match every mapped-depth stem exactly")
     frames, chunk_ids = _load_trajectory(trajectory_path, {path.name for path in rgb_paths})
     if expected_frame_count is not None and len(frames) != expected_frame_count:
         raise ExportContractError(
@@ -1010,8 +1063,11 @@ def export_colmap_rgbd_training(
     scene_root = output_root / f"scenes/{SCENE_NAME}"
     rgb_output = scene_root / "rgb"
     depth_output = scene_root / "depth"
+    observed_output = scene_root / "original_depth_observed"
     rgb_output.mkdir(parents=True, exist_ok=True)
     depth_output.mkdir(parents=True, exist_ok=True)
+    if original_depth_observed_root is not None:
+        observed_output.mkdir(parents=True, exist_ok=True)
     for generic_index, frame in enumerate(frames):
         rgb_path = source_rgbd_root / "rgb" / str(frame["image_name"])
         if not rgb_path.is_file():
@@ -1035,6 +1091,28 @@ def export_colmap_rgbd_training(
         exported_depth = _warp_image(depth, crop, (width, height), depth=True).astype(np.uint16)
         Image.fromarray(exported_rgb).save(rgb_output / generic_name, optimize=False)
         Image.fromarray(exported_depth).save(depth_output / generic_name, optimize=False)
+        if original_depth_observed_root is not None:
+            observed_path = observed_by_key[key]
+            with Image.open(observed_path) as image:
+                observed = np.asarray(image)
+            if (
+                observed.shape != depth.shape
+                or observed.dtype not in {np.dtype(np.uint8), np.dtype(np.uint16), np.dtype(np.bool_)}
+                or (observed.dtype == np.uint8 and not np.isin(observed, (0, 1, 255)).all())
+                or np.any((observed != 0) & (depth == 0))
+            ):
+                raise ExportContractError(
+                    f"original-observation mask {generic_index} violates the pre-dilation contract"
+                )
+            exported_observed = _warp_image(
+                np.where(observed != 0, 255, 0).astype(np.uint8),
+                crop,
+                (width, height),
+                depth=True,
+            ).astype(np.uint8)
+            if np.any((exported_observed != 0) & (exported_depth == 0)):
+                raise ExportContractError("warped original-observation mask is outside exported depth")
+            Image.fromarray(exported_observed).save(observed_output / generic_name, optimize=False)
 
     repeated_intrinsics = np.repeat(updated_intrinsics[None], frame_count, axis=0).astype(np.float32)
     np.savez_compressed(
@@ -1067,8 +1145,8 @@ def export_colmap_rgbd_training(
     )
     _write_split_files(output_root, sequence_splits)
     dataset = {
-        "schema_version": 1,
-        "format": DATASET_FORMAT,
+        "schema_version": 2 if original_depth_observed_root is not None else 1,
+        "format": DATASET_FORMAT_V2 if original_depth_observed_root is not None else DATASET_FORMAT,
         "scene_count": 1,
         "frame_count": frame_count,
         "image": {"height": height, "width": width, "channels": 3, "dtype": "uint8"},
@@ -1105,9 +1183,19 @@ def export_colmap_rgbd_training(
         },
         "splits": {name: int(np.sum(sequence_splits == index)) for index, name in enumerate(SPLIT_NAMES)},
     }
+    if original_depth_observed_root is not None:
+        dataset["original_depth_observed"] = {
+            "directory": "original_depth_observed",
+            "dtype": "uint8",
+            "false_value": 0,
+            "meaning": "pre_dilation_sensor_observation",
+            "true_value": 255,
+        }
     (output_root / "dataset.json").write_text(json.dumps(dataset, indent=2, sort_keys=True) + "\n")
     (output_root / "reports").mkdir(parents=True, exist_ok=True)
     tokens = _private_tokens(source_rgbd_root, trajectory_path, rgb_camera_yaml, rgb_paths, serial)
+    if original_depth_observed_root is not None:
+        tokens = (*tokens, original_depth_observed_root.name, str(original_depth_observed_root.absolute()))
     report = validate_staging(output_root, private_tokens=tokens, require_report=False)
     (output_root / "reports/export_validation.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     if not report["valid"]:
@@ -1184,6 +1272,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-rgbd-root", type=Path)
     parser.add_argument("--trajectory", type=Path)
     parser.add_argument("--rgb-camera-yaml", type=Path)
+    parser.add_argument("--original-depth-observed-root", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--prepare-overlap-profile", action="store_true")
@@ -1252,6 +1341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             guard_frames=args.guard_frames,
             max_translation_m=args.max_translation_m,
             max_rotation_deg=args.max_rotation_deg,
+            original_depth_observed_root=args.original_depth_observed_root,
         )
     except (ExportContractError, OSError, ValueError) as error:
         print(f"error: {error}")

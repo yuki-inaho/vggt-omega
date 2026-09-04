@@ -29,6 +29,59 @@ def test_default_training_config_composes_and_validates() -> None:
     assert cfg.checkpoint.k == 3
     assert cfg.checkpoint.monitor == "val/objective"
     assert cfg.logging.name == "tensorboard"
+    assert cfg.performance.compile.enabled is False
+    assert cfg.performance.data_loader.prefetch_factor == 2
+    assert cfg.performance.runtime_contracts.first_batch_only is True
+
+
+def test_profiled_compile_performance_config_composes_and_validates() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_fixed4_b14",
+        "pixel_depth=pixel_perfect_gpa_correspondence",
+        "performance=profiled_compile",
+        "trainer=finetune",
+        "trainer.epochs=6",
+    )
+
+    validate_training_config(cfg)
+
+    assert cfg.performance.compile.enabled is True
+    assert cfg.performance.compile.backend == "inductor"
+    assert cfg.performance.compile.mode == "default"
+    assert cfg.performance.profiling.enabled is True
+    assert cfg.performance.data_loader.persistent_workers is True
+
+
+def test_compile_profile_requires_matching_pixel_depth_modules() -> None:
+    cfg = _compose("performance=profiled_compile")
+
+    with pytest.raises(ValueError, match="pixel_depth"):
+        validate_training_config(cfg)
+
+
+def test_compile_correspondence_target_requires_enabled_head() -> None:
+    cfg = _compose("pixel_depth=pixel_perfect_guarded", "performance=profiled_compile")
+
+    with pytest.raises(ValueError, match="correspondence_head"):
+        validate_training_config(cfg)
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_data_loader_prefetch_factor_must_be_positive_integer(value: object) -> None:
+    cfg = _compose()
+    cfg.performance.data_loader.prefetch_factor = value
+
+    with pytest.raises(ValueError, match="prefetch_factor"):
+        validate_training_config(cfg)
+
+
+def test_profiling_requires_single_optimizer_step_per_profiled_batch() -> None:
+    cfg = _compose()
+    cfg.performance.profiling.enabled = True
+    cfg.trainer.gradient_accumulation_steps = 2
+
+    with pytest.raises(ValueError, match="gradient_accumulation_steps=1"):
+        validate_training_config(cfg)
 
 
 def test_camera_motion_curriculum_composes_and_validates() -> None:
@@ -68,13 +121,105 @@ def test_near_depth_focus_config_validates() -> None:
     assert cfg.loss.training.depth_weight == pytest.approx(4.0)
 
 
+def test_fixed_four_frame_batch14_profile_composes_and_validates() -> None:
+    cfg = _compose("data=colmap_rgbd_fixed4_b14", "trainer=finetune")
+
+    validate_training_config(cfg)
+
+    assert cfg.data.min_frames == 4
+    assert cfg.data.max_frames == 4
+    assert cfg.data.batch_size == 14
+
+
+def test_fixed_four_frame_batch8_profile_composes_and_validates() -> None:
+    cfg = _compose("data=colmap_rgbd_fixed4_b8", "trainer=finetune")
+
+    validate_training_config(cfg)
+
+    assert cfg.data.min_frames == 4
+    assert cfg.data.max_frames == 4
+    assert cfg.data.batch_size == 8
+
+
+def test_guarded_pixel_depth_profile_starts_at_exact_baseline() -> None:
+    cfg = _compose("pixel_depth=pixel_perfect_guarded")
+
+    validate_training_config(cfg)
+
+    assert cfg.pixel_depth.flow.residual_gate_initial == pytest.approx(0.0)
+    assert cfg.pixel_depth.optimization.train_base_heads is False
+
+
+def test_gpa_correspondence_curriculum_profile_has_six_guarded_stages() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_fixed4_b14",
+        "pixel_depth=pixel_perfect_gpa_correspondence",
+        "loss=near_depth_focus",
+        "trainer=finetune",
+        "trainer.epochs=6",
+    )
+
+    validate_training_config(cfg)
+
+    stages = cfg.pixel_depth.self_supervised.curriculum
+    assert [stage.name for stage in stages] == [
+        "baseline_parity",
+        "residual_gate",
+        "gpa_warmup",
+        "correspondence_head",
+        "joint_low_lr",
+        "near_depth_recovery",
+    ]
+    assert [stage.start_epoch for stage in stages] == list(range(6))
+    assert stages[0].train_enabled is False
+    assert stages[3].train_refiner is False and stages[3].train_correspondence is True
+    assert cfg.pixel_depth.flow.residual_gate_initial == pytest.approx(0.0)
+    assert cfg.pixel_depth.optimization.train_base_heads is True
+    assert stages[1].train_base_heads is False
+    assert stages[2].train_base_heads is True
+    assert cfg.pixel_depth.self_supervised.guardrail.enabled is True
+    assert set(cfg.pixel_depth.self_supervised.guardrail.metrics) == {
+        "near_depth_mae_m",
+        "camera_translation",
+        "objective",
+    }
+
+
+def test_gpa_anchor_count_cannot_exceed_guaranteed_frame_count() -> None:
+    cfg = _compose(
+        "pixel_depth=pixel_perfect_gpa_correspondence",
+        "trainer=finetune",
+        "trainer.epochs=6",
+    )
+
+    with pytest.raises(ValueError, match="anchor_count"):
+        validate_training_config(cfg)
+
+
+@pytest.mark.parametrize("value", [0.0, float("nan"), float("inf")])
+def test_metric_depth_limit_must_be_finite_and_positive(value: float) -> None:
+    cfg = _compose("loss=near_depth_focus", "trainer=finetune", "trainer.epochs=5")
+    cfg.loss.training.max_metric_depth_m = value
+
+    with pytest.raises(ValueError, match="max_metric_depth_m"):
+        validate_training_config(cfg)
+
+
+def test_pixel_depth_residual_gate_rejects_values_above_one() -> None:
+    cfg = _compose("pixel_depth=pixel_perfect_guarded")
+    cfg.pixel_depth.flow.residual_gate_initial = 1.01
+
+    with pytest.raises(ValueError, match="residual_gate_initial"):
+        validate_training_config(cfg)
+
+
 def test_erayzer_overlap_pairwise_profiles_compose_with_warmup() -> None:
     cfg = _compose(
         "data=colmap_rgbd_overlap",
         "model=omega_1b_512_near_head",
         "loss=erayzer_pairwise_near",
         "trainer=finetune",
-        "trainer.epochs=4",
+        "trainer.epochs=6",
     )
 
     validate_training_config(cfg)
@@ -156,6 +301,66 @@ def test_initial_head_checkpoint_must_be_private_safe_relative_path(path: str) -
     cfg.model.initial_head_checkpoint = path
 
     with pytest.raises(ValueError, match="initial_head_checkpoint"):
+        validate_training_config(cfg)
+
+
+def test_dynamic_geometry_disabled_is_the_default_noop_profile() -> None:
+    cfg = _compose()
+
+    validate_training_config(cfg)
+
+    assert cfg.dynamic_geometry.enabled is False
+    assert cfg.dynamic_geometry.contract_version == 1
+
+
+def test_dynamic_geometry_v1_curriculum_composes_and_validates() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_fixed4_b14",
+        "pixel_depth=pixel_perfect_gpa_correspondence",
+        "dynamic_geometry=v1",
+        "trainer=finetune",
+        "trainer.epochs=6",
+    )
+
+    validate_training_config(cfg)
+
+    assert cfg.dynamic_geometry.depth_source == "pixel_refined_fixed_noise"
+    assert cfg.dynamic_geometry.geometry.max_depth_m == pytest.approx(1.2)
+    assert [stage.name for stage in cfg.dynamic_geometry.curriculum] == [
+        "baseline_parity",
+        "motion_only",
+        "visibility_dynamic",
+        "joint_low_lr",
+    ]
+
+
+def test_dynamic_geometry_requires_pixel_depth_wrapper() -> None:
+    cfg = _compose("dynamic_geometry=v1", "trainer=finetune", "trainer.epochs=6")
+
+    with pytest.raises(ValueError, match=r"pixel_depth\.enabled"):
+        validate_training_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("visibility_threshold", -0.1),
+        ("static_probability_max", 0.9),
+        ("dynamic_probability_min", 0.2),
+        ("pair_chunk_size", 0),
+    ],
+)
+def test_dynamic_geometry_rejects_invalid_thresholds(key: str, value: object) -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_fixed4_b14",
+        "pixel_depth=pixel_perfect_gpa_correspondence",
+        "dynamic_geometry=v1",
+        "trainer=finetune",
+        "trainer.epochs=6",
+    )
+    cfg.dynamic_geometry[key] = value
+
+    with pytest.raises(ValueError, match="dynamic_geometry"):
         validate_training_config(cfg)
 
 

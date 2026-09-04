@@ -143,6 +143,39 @@ def test_topk_rejects_missing_monitored_metric(tmp_path: Path) -> None:
         )
 
 
+def test_near_edge_topk_orders_three_best_and_rejects_missing_metric(tmp_path: Path) -> None:
+    monitor = "val/near_edge_objective"
+    manager = TopKCheckpointManager(tmp_path, k=3, monitor=monitor, mode="min")
+    model = _TinyModel()
+    optimizer = torch.optim.SGD(model.head.parameters(), lr=0.1)
+    for epoch, metric in enumerate((0.5, 0.2, 0.4, 0.1)):
+        manager.update(
+            epoch=epoch,
+            global_step=epoch + 1,
+            metrics={monitor: metric},
+            model=model,
+            optimizer=optimizer,
+            state_selector=_head_state,
+            group_fingerprint=GROUP_FINGERPRINT,
+            config={"checkpoint": {"monitor": monitor}},
+            metadata=_base_metadata(),
+        )
+
+    assert [entry["metric"] for entry in manager.entries] == [0.1, 0.2, 0.4]
+    with pytest.raises(KeyError, match=monitor):
+        manager.update(
+            epoch=4,
+            global_step=5,
+            metrics={},
+            model=model,
+            optimizer=optimizer,
+            state_selector=_head_state,
+            group_fingerprint=GROUP_FINGERPRINT,
+            config={},
+            metadata=_base_metadata(),
+        )
+
+
 def test_topk_atomic_replacements_use_same_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     replacements: list[tuple[Path, Path]] = []
     real_replace = os.replace

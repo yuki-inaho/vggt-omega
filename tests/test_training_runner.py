@@ -17,13 +17,226 @@ import vggt_omega.training.runner as runner_module
 from vggt_omega.training.losses import build_camera_pose_target
 from vggt_omega.training.model_factory import PreparedTrainingModel
 from vggt_omega.training.runner import (
+    _apply_pixel_curriculum_stage,
+    _compile_training_modules,
+    _guardrail_violations,
     _initialize_head_from_checkpoint,
+    _make_loader,
+    _pixel_depth_runtime_options,
+    _runtime_metadata,
+    _total_optimizer_steps,
     _training_loss_options,
     _validate_resume_config,
     run_training,
     train_one_epoch,
     validate_one_epoch,
 )
+
+
+def test_pixel_curriculum_stage_toggles_trainable_groups_and_learning_rate() -> None:
+    from tests.test_training_pixel_depth_model import _model
+
+    model = _model(correspondence_enabled=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    base_lrs = tuple(float(group["lr"]) for group in optimizer.param_groups)
+    options = {
+        "curriculum": {
+            "train_enabled": True,
+            "train_refiner": False,
+            "train_correspondence": True,
+            "train_base_heads": False,
+            "learning_rate_scale": 0.2,
+        }
+    }
+
+    train_enabled = _apply_pixel_curriculum_stage(
+        model,
+        optimizer,
+        options,
+        base_learning_rates=base_lrs,
+    )
+
+    assert train_enabled is True
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(2e-4)
+    assert not model.base_model.scale.requires_grad
+    assert not any(
+        parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if name.startswith(("semantic_adapter.", "temporal_mixer.", "refiner.", "residual_gate."))
+    )
+    assert all(
+        parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if name.startswith("correspondence_head.")
+    )
+
+    options["curriculum"]["train_enabled"] = False
+    assert not _apply_pixel_curriculum_stage(model, optimizer, options, base_learning_rates=base_lrs)
+
+
+def test_pixel_depth_runtime_options_resolve_active_self_supervised_stage() -> None:
+    config = {
+        "flow": {"objective_weight": 9.0, "ode_steps": 4},
+        "geometry": {"max_depth_m": 1.2},
+        "self_supervised": {
+            "gpa": {"enabled": True},
+            "correspondence": {"enabled": True},
+            "guardrail": {"enabled": False, "metrics": {}},
+            "curriculum": [
+                {
+                    "name": "baseline_parity",
+                    "start_epoch": 0,
+                    "flow_weight": 0.0,
+                    "gpa_weight": 0.0,
+                    "correspondence_weight": 0.0,
+                },
+                {
+                    "name": "residual_gate",
+                    "start_epoch": 1,
+                    "flow_weight": 1.0,
+                    "gpa_weight": 0.0,
+                    "correspondence_weight": 0.0,
+                },
+                {
+                    "name": "gpa_warmup",
+                    "start_epoch": 2,
+                    "flow_weight": 0.5,
+                    "gpa_weight": 0.1,
+                    "correspondence_weight": 0.0,
+                },
+            ],
+        },
+    }
+
+    options = _pixel_depth_runtime_options(config, epoch=2)
+
+    assert options is not None
+    assert options["objective_weight"] == pytest.approx(0.5)
+    assert options["gpa"]["objective_weight"] == pytest.approx(0.1)
+    assert options["correspondence"]["objective_weight"] == pytest.approx(0.0)
+    assert options["curriculum_stage_name"] == "gpa_warmup"
+    assert options["curriculum_stage_index"] == 2
+
+
+def test_runtime_metadata_reports_cuda_allocated_and_reserved_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _device: 3 * 1024**3)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda _device: 5 * 1024**3)
+
+    metadata = _runtime_metadata(torch.device("cuda"), started_at=0.0)
+
+    assert metadata["max_cuda_memory_gib"] == pytest.approx(3.0)
+    assert metadata["max_cuda_memory_reserved_gib"] == pytest.approx(5.0)
+
+
+def test_compile_training_modules_is_explicit_and_preserves_parameter_names() -> None:
+    class _CompileHolder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.refiner = torch.nn.Linear(3, 2)
+
+    model = _CompileHolder()
+    values = torch.randn(4, 3)
+    expected = model.refiner(values)
+    before = tuple(name for name, _ in model.named_parameters())
+    metadata = _compile_training_modules(
+        model,
+        {
+            "enabled": True,
+            "backend": "eager",
+            "mode": "default",
+            "fullgraph": False,
+            "dynamic": False,
+            "targets": ["refiner"],
+        },
+    )
+
+    assert metadata["enabled"] is True
+    assert metadata["targets"] == ["refiner"]
+    assert tuple(name for name, _ in model.named_parameters()) == before
+    torch.testing.assert_close(model.refiner(values), expected)
+
+
+def test_compile_training_modules_rejects_unknown_or_missing_target() -> None:
+    model = torch.nn.Linear(2, 2)
+    options = {
+        "enabled": True,
+        "backend": "eager",
+        "mode": "default",
+        "fullgraph": False,
+        "dynamic": False,
+        "targets": ["refiner"],
+    }
+
+    with pytest.raises(ValueError, match="missing compile target"):
+        _compile_training_modules(model, options)
+
+
+def test_compile_training_modules_disabled_is_an_exact_noop() -> None:
+    class _ExplodesIfCompiled(torch.nn.Linear):
+        def compile(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("disabled compile must not touch the module")
+
+    class _CompileHolder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.refiner = _ExplodesIfCompiled(3, 2)
+
+    model = _CompileHolder()
+    before = tuple((name, parameter.detach().clone()) for name, parameter in model.named_parameters())
+
+    metadata = _compile_training_modules(
+        model,
+        {
+            "enabled": False,
+            "backend": "inductor",
+            "mode": "default",
+            "fullgraph": False,
+            "dynamic": False,
+            "targets": ["refiner"],
+        },
+    )
+
+    assert metadata["enabled"] is False
+    assert tuple(name for name, _ in model.named_parameters()) == tuple(name for name, _ in before)
+    for (_, parameter), (_, expected) in zip(model.named_parameters(), before, strict=True):
+        torch.testing.assert_close(parameter, expected)
+
+
+def test_compile_training_modules_propagates_backend_failure() -> None:
+    class _FailingCompile(torch.nn.Linear):
+        def compile(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise RuntimeError("backend unavailable")
+
+    class _CompileHolder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.refiner = _FailingCompile(3, 2)
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        _compile_training_modules(
+            _CompileHolder(),
+            {
+                "enabled": True,
+                "backend": "inductor",
+                "mode": "default",
+                "fullgraph": False,
+                "dynamic": False,
+                "targets": ["refiner"],
+            },
+        )
+
+
+def test_make_loader_applies_worker_prefetch_and_persistence() -> None:
+    config_dir = Path(__file__).parents[1] / "configs" / "training"
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(config_name="config", overrides=["data.num_workers=2"])
+    loader = _make_loader(_TinyDataset(), cfg, epoch=0, training=True)
+
+    assert loader.num_workers == 2
+    assert loader.prefetch_factor == 2
+    assert loader.persistent_workers is True
 
 
 class _TinyCameraDepthModel(torch.nn.Module):
@@ -95,6 +308,33 @@ def test_train_one_epoch_updates_model_logs_scalars_and_clips_gradients() -> Non
     assert [step for step, _ in logger.records] == [1, 2]
     assert all("train/objective" in scalars for _, scalars in logger.records)
     assert all("train/grad_norm" in scalars for _, scalars in logger.records)
+
+
+def test_train_one_epoch_reports_profiled_throughput_and_checks_first_batch_contract() -> None:
+    model = _TinyCameraDepthModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+    result = train_one_epoch(
+        model=model,
+        batches=[_batch(), _batch(), _batch()],
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        gradient_clip_norm=1.0,
+        gradient_accumulation_steps=1,
+        min_valid_depth_pixels=1,
+        global_step=0,
+        logger=None,
+        log_every_steps=1,
+        performance_options={
+            "profiling": {"enabled": True, "warmup_steps": 1, "active_steps": 2},
+            "runtime_contracts": {"enabled": True, "first_batch_only": True},
+        },
+    )
+
+    assert result.metrics["profile_active_steps"] == 2
+    assert result.metrics["profile_step_time_seconds"] > 0
+    assert result.metrics["profile_samples_per_second"] > 0
+    assert 0 <= result.metrics["profile_data_wait_fraction"] <= 1
 
 
 def test_train_one_epoch_honors_accumulation_and_step_limit() -> None:
@@ -749,3 +989,51 @@ def test_initial_head_run_resumes_with_same_provenance(tmp_path: Path, monkeypat
     assert summary["epochs_completed"] == 2
     assert summary["global_step"] == 4
     assert summary["initial_head_checkpoint"]["sha256"] == hashlib.sha256(initial.read_bytes()).hexdigest()
+
+
+def test_total_optimizer_steps_excludes_validation_only_curriculum_epoch() -> None:
+    config_dir = Path(__file__).parents[1] / "configs" / "training"
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="config",
+            overrides=[
+                "data=colmap_rgbd_fixed4_b14",
+                "pixel_depth=pixel_perfect_gpa_correspondence",
+                "trainer=finetune",
+                "trainer.epochs=6",
+            ],
+        )
+
+    assert _total_optimizer_steps(cfg, dataset_length=28) == 10
+
+
+def test_curriculum_guardrail_reports_only_excess_degradation() -> None:
+    guardrail = {
+        "enabled": True,
+        "metrics": {
+            "near_depth_mae_m": {"max_relative_degradation": 0.10, "max_absolute_degradation": 0.01},
+            "camera_translation": {"max_relative_degradation": 0.05, "max_absolute_degradation": 0.001},
+            "objective": {"max_relative_degradation": 0.10, "max_absolute_degradation": 0.02},
+        },
+    }
+    baseline = {"near_depth_mae_m": 0.10, "camera_translation": 0.02, "objective": 1.0}
+    current = {"near_depth_mae_m": 0.109, "camera_translation": 0.03, "objective": 1.05}
+
+    violations = _guardrail_violations(baseline, current, guardrail)
+
+    assert set(violations) == {"camera_translation"}
+    assert violations["camera_translation"]["baseline"] == pytest.approx(0.02)
+    assert violations["camera_translation"]["current"] == pytest.approx(0.03)
+    assert violations["camera_translation"]["allowed"] == pytest.approx(0.021)
+
+
+def test_curriculum_guardrail_rejects_missing_or_nonfinite_metrics() -> None:
+    guardrail = {
+        "enabled": True,
+        "metrics": {"objective": {"max_relative_degradation": 0.1, "max_absolute_degradation": 0.0}},
+    }
+
+    with pytest.raises(ValueError, match="missing"):
+        _guardrail_violations({"objective": 1.0}, {}, guardrail)
+    with pytest.raises(ValueError, match="finite"):
+        _guardrail_violations({"objective": 1.0}, {"objective": float("nan")}, guardrail)

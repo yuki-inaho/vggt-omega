@@ -171,6 +171,131 @@ def test_exporter_writes_anonymous_numeric_overlap_profile(exported_staging: Pat
     assert PRIVATE_TOKEN.encode() not in profile_path.read_bytes()
 
 
+def _upgrade_fixture_to_v2(root: Path) -> None:
+    metadata_path = root / "dataset.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["schema_version"] = 2
+    metadata["format"] = "colmap_rgbd_v2"
+    metadata["original_depth_observed"] = {
+        "directory": "original_depth_observed",
+        "dtype": "uint8",
+        "false_value": 0,
+        "meaning": "pre_dilation_sensor_observation",
+        "true_value": 255,
+    }
+    metadata_path.write_text(json.dumps(metadata))
+    scene = root / "scenes/scene_000000"
+    observed_root = scene / "original_depth_observed"
+    observed_root.mkdir()
+    for depth_path in (scene / "depth").glob("*.png"):
+        depth = np.asarray(Image.open(depth_path))
+        Image.fromarray(np.where(depth > 0, 255, 0).astype(np.uint8)).save(observed_root / depth_path.name)
+
+
+def test_v2_dataset_loads_strict_original_observation_mask(exported_staging: Path) -> None:
+    _upgrade_fixture_to_v2(exported_staging)
+    dataset = ColmapRgbdDataset(exported_staging, split="smoke", min_frames=2, max_frames=2)
+
+    sample = dataset[0]
+
+    assert sample["original_depth_observed_mask"].dtype is torch.bool
+    assert sample["original_depth_observed_mask"].shape == sample["depth_masks"].shape
+    assert not (sample["original_depth_observed_mask"] & ~sample["depth_masks"]).any()
+
+
+def test_v2_dataset_rejects_observation_outside_dilated_depth(exported_staging: Path) -> None:
+    _upgrade_fixture_to_v2(exported_staging)
+    mask_path = exported_staging / "scenes/scene_000000/original_depth_observed/frame_000000.png"
+    mask = np.asarray(Image.open(mask_path)).copy()
+    mask[0, 0] = 255
+    Image.fromarray(mask).save(mask_path)
+    dataset = ColmapRgbdDataset(exported_staging, split="train", min_frames=2, max_frames=2)
+
+    with pytest.raises(DataContractError, match="original-depth-observed mask"):
+        dataset._load_pixels("scene_000000", np.asarray([0], dtype=np.int64))
+
+
+def test_exporter_v2_reencodes_private_original_observation_masks(tmp_path: Path) -> None:
+    source, trajectory, camera_yaml = _write_private_source(tmp_path)
+    private_observed = tmp_path / f"{PRIVATE_TOKEN}_observed"
+    private_observed.mkdir()
+    for depth_path in (source / "mapped_depth").glob("*.png"):
+        depth = np.asarray(Image.open(depth_path))
+        Image.fromarray(np.where(depth > 0, 255, 0).astype(np.uint8)).save(private_observed / depth_path.name)
+    output = tmp_path / "anonymous_v2"
+
+    report = export_colmap_rgbd_training(
+        source_rgbd_root=source,
+        trajectory_path=trajectory,
+        rgb_camera_yaml=camera_yaml,
+        output_root=output,
+        height=48,
+        width=64,
+        expected_dilation_kernel=3,
+        guard_frames=1,
+        split_fractions=(0.6, 0.2, 0.2),
+        original_depth_observed_root=private_observed,
+    )
+
+    assert report["valid"]
+    metadata = json.loads((output / "dataset.json").read_text())
+    assert metadata["format"] == "colmap_rgbd_v2"
+    assert metadata["schema_version"] == 2
+    files = [path for path in output.rglob("*") if path.is_file()]
+    assert all(PRIVATE_TOKEN.encode() not in path.read_bytes() for path in files)
+    dataset = ColmapRgbdDataset(output, split="smoke", min_frames=2, max_frames=2)
+    assert "original_depth_observed_mask" in dataset[0]
+
+
+def _write_flow_teacher(root: Path, frame_count: int = 15) -> None:
+    manifest_root = root / "flow_teacher"
+    manifest_root.mkdir()
+    (manifest_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "coordinate_space": "pixel_displacement_xy",
+                "file_template": "scenes/{scene_id}/flow_teacher/pair_{source_id:06d}_{target_id:06d}.npz",
+                "flow_dtype": "float32",
+                "format": "dynamic_flow_teacher_v1",
+                "occlusion_dtype": "int8_tri_state",
+                "schema_version": 1,
+            }
+        )
+    )
+    pair_root = root / "scenes/scene_000000/flow_teacher"
+    pair_root.mkdir()
+    flow = np.zeros((48, 64, 2), dtype=np.float32)
+    confidence = np.ones((48, 64), dtype=np.float32)
+    occlusion = np.ones((48, 64), dtype=np.int8)
+    for source in range(frame_count - 1):
+        for left, right in ((source, source + 1), (source + 1, source)):
+            np.savez_compressed(
+                pair_root / f"pair_{left:06d}_{right:06d}.npz",
+                flow_xy=flow,
+                confidence=confidence,
+                occlusion_label=occlusion,
+            )
+
+
+def test_dataset_loads_anonymous_directed_flow_teacher_in_temporal_order(exported_staging: Path) -> None:
+    _upgrade_fixture_to_v2(exported_staging)
+    _write_flow_teacher(exported_staging)
+    dataset = ColmapRgbdDataset(
+        exported_staging,
+        split="train",
+        min_frames=3,
+        max_frames=3,
+        flow_teacher_manifest="flow_teacher/manifest.json",
+    )
+
+    sample = dataset[0]
+
+    assert sample["motion_pixel_flow_xy"].shape == (4, 48, 64, 2)
+    assert sample["motion_flow_confidence"].shape == (4, 48, 64)
+    assert sample["motion_flow_occlusion_label"].dtype is torch.int8
+    assert torch.equal(sample["motion_flow_occlusion_label"], torch.ones_like(sample["motion_flow_occlusion_label"]))
+
+
 def test_existing_anonymous_staging_can_be_upgraded_with_overlap_profile(exported_staging: Path) -> None:
     profile_path = exported_staging / "scenes/scene_000000/overlap.npz"
     profile_path.unlink()
@@ -363,6 +488,21 @@ def test_loader_fails_explicitly_for_too_short_sequence(exported_staging: Path) 
 
     with pytest.raises(DataContractError, match="shorter"):
         dataset[0]
+
+
+def test_loader_can_filter_short_sequences_for_fixed_length_batches(exported_staging: Path) -> None:
+    unfiltered = ColmapRgbdDataset(exported_staging, split="train", min_frames=4, max_frames=4, seed=0)
+    filtered = ColmapRgbdDataset(
+        exported_staging,
+        split="train",
+        min_frames=4,
+        max_frames=4,
+        seed=0,
+        filter_short_sequences=True,
+    )
+
+    assert 0 < len(filtered) < len(unfiltered)
+    assert all(filtered[index]["images"].shape[0] == 4 for index in range(len(filtered)))
 
 
 def test_loader_rejects_metadata_that_claims_a_second_depth_dilation(exported_staging: Path) -> None:

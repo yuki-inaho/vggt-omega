@@ -1,0 +1,18 @@
+name: colmap_rgbd_fixed4_b8
+root: ../vggt_training_data/colmap_rgbd_v1
+train_split: train
+val_split: val
+smoke_split: smoke
+min_frames: 4
+max_frames: 4
+batch_size: 8
+num_workers: 2
+pin_memory: true
+min_valid_depth_pixels: 1024
+overlap_curriculum:
+  enabled: false
+  metric: near_depth
+  start_target: 0.24386708438396454
+  end_target: 0.1284112185239792
+  target_tolerance: 0.05
+  epochs: 4

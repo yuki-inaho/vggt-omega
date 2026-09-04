@@ -13,6 +13,7 @@ import vggt_omega.training.evaluation as evaluation_module
 from scripts.evaluate_training_checkpoints import main as evaluation_cli_main
 from vggt_omega.training.evaluation import (
     EvaluationError,
+    _validate_completed_summary,
     _validation_loss_options,
     evaluate_training_checkpoints,
 )
@@ -69,6 +70,114 @@ def test_validation_loss_options_are_read_from_resolved_config() -> None:
         "rotation_weight": 3.0,
         "fov_weight": 0.25,
     }
+
+
+def test_completed_summary_accepts_exact_global_step_limit() -> None:
+    config = _resolved_config()
+    config["trainer"]["epochs"] = 6
+    config["trainer"]["max_train_steps"] = 1
+    base = {"filename": "base.pt", "sha256": "a" * 64, "size_bytes": 1}
+    summary = {
+        "base_checkpoint": base,
+        "best": [],
+        "early_stopping": {
+            "bad_epochs": 0,
+            "best": None,
+            "enabled": False,
+            "min_delta": 0.0,
+            "mode": "min",
+            "monitor": "val/objective",
+            "patience": 2,
+            "stopped": False,
+        },
+        "epochs_completed": 2,
+        "global_step": 1,
+        "group_fingerprint": GROUP_FINGERPRINT,
+        "status": "complete",
+        "stopped_early": False,
+        "train": {"objective": 2.0},
+        "validation": {"objective": 1.5},
+    }
+
+    completed_epochs, global_step, _, _ = _validate_completed_summary(summary, config, base)
+
+    assert (completed_epochs, global_step) == (2, 1)
+
+
+def test_completed_summary_rejects_incomplete_run_below_global_step_limit() -> None:
+    config = _resolved_config()
+    config["trainer"]["epochs"] = 6
+    config["trainer"]["max_train_steps"] = 2
+    base = {"filename": "base.pt", "sha256": "a" * 64, "size_bytes": 1}
+    summary = {
+        "base_checkpoint": base,
+        "best": [],
+        "early_stopping": {
+            "bad_epochs": 0,
+            "best": None,
+            "enabled": False,
+            "min_delta": 0.0,
+            "mode": "min",
+            "monitor": "val/objective",
+            "patience": 2,
+            "stopped": False,
+        },
+        "epochs_completed": 2,
+        "global_step": 1,
+        "group_fingerprint": GROUP_FINGERPRINT,
+        "status": "complete",
+        "stopped_early": False,
+        "train": {"objective": 2.0},
+        "validation": {"objective": 1.5},
+    }
+
+    with pytest.raises(EvaluationError, match="expected configured epochs"):
+        _validate_completed_summary(summary, config, base)
+
+
+def test_evaluator_attaches_enabled_dynamic_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    prepared = PreparedTrainingModel(model=_TinyHeadModel(), trainable_parameter_names=("head",))
+    dynamic_config = {"enabled": True, "contract_version": 1}
+    captured: list[tuple[PreparedTrainingModel, dict[str, Any], torch.device]] = []
+
+    def fake_attach(
+        value: PreparedTrainingModel,
+        config: dict[str, Any],
+        *,
+        device: torch.device,
+    ) -> PreparedTrainingModel:
+        captured.append((value, config, device))
+        return value
+
+    monkeypatch.setattr(evaluation_module, "attach_dynamic_geometry_model", fake_attach, raising=False)
+
+    actual, _, pixel_enabled = evaluation_module._attach_configured_training_wrappers(
+        prepared,
+        {"pixel_depth": {"enabled": False}, "dynamic_geometry": dynamic_config},
+        device=torch.device("cpu"),
+    )
+
+    assert actual is prepared
+    assert pixel_enabled is False
+    assert captured == [(prepared, dynamic_config, torch.device("cpu"))]
+
+
+def test_validation_dataset_receives_dynamic_flow_teacher_manifest(tmp_path: Path) -> None:
+    config = _resolved_config()
+    config["dynamic_geometry"] = {
+        "enabled": True,
+        "pseudo_labels": {"teacher_artifact_manifest": "flow_teacher/manifest.json"},
+    }
+    (tmp_path / "private-staging").mkdir()
+    captured: list[dict[str, Any]] = []
+
+    def factory(_root: Path, **options: Any) -> _TinyDataset:
+        captured.append(options)
+        return _TinyDataset()
+
+    evaluation_module._validation_dataset(config, tmp_path / "original", factory)
+
+    assert captured[0]["flow_teacher_manifest"] == "flow_teacher/manifest.json"
 
 
 def test_pairwise_validation_options_and_monitor_names_are_stable() -> None:
@@ -287,6 +396,7 @@ def test_evaluator_strictly_checks_and_recomputes_every_best_without_paths(tmp_p
     assert datasets[0][0] == tmp_path / "private-staging"
     assert datasets[0][1] == "val"
     assert datasets[0][2] == {
+        "filter_short_sequences": True,
         "max_frames": 2,
         "min_frames": 2,
         "min_valid_depth_pixels": 1,

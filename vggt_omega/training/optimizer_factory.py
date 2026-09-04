@@ -15,8 +15,35 @@ AMUSE_TERMINAL_PARAMETER_NAMES = (
     "camera_head.camera_branch.2.weight",
     "dense_head.proj.weight",
 )
-_TRAINABLE_PREFIXES = ("camera_head.", "dense_head.")
-_CONFIDENCE_PREFIX = "dense_head.proj_conf."
+_TERMINAL_PARAMETER_SUFFIXES = (
+    *AMUSE_TERMINAL_PARAMETER_NAMES,
+    "refiner.output_projection.weight",
+    "correspondence_head.output_projection.weight",
+)
+_TRAINABLE_PREFIXES = (
+    "camera_head.",
+    "dense_head.",
+    "base_model.camera_head.",
+    "base_model.dense_head.",
+    "semantic_adapter.",
+    "temporal_mixer.",
+    "refiner.",
+    "residual_gate.",
+    "correspondence_head.",
+    "dynamic_geometry_head.",
+    "wrapped_model.base_model.camera_head.",
+    "wrapped_model.base_model.dense_head.",
+    "wrapped_model.semantic_adapter.",
+    "wrapped_model.temporal_mixer.",
+    "wrapped_model.refiner.",
+    "wrapped_model.residual_gate.",
+    "wrapped_model.correspondence_head.",
+)
+_CONFIDENCE_PREFIXES = (
+    "dense_head.proj_conf.",
+    "base_model.dense_head.proj_conf.",
+    "wrapped_model.base_model.dense_head.proj_conf.",
+)
 _SUPPORTED_STRATEGIES = {"single", "ddp"}
 
 
@@ -115,13 +142,14 @@ def classify_amuse_parameters(model: torch.nn.Module) -> AmuseParameterGrouping:
     """Classify the frozen-backbone VGGT-Omega heads for AMUSE."""
 
     named_parameters = _named_parameters(model)
-    absent_terminal = set(AMUSE_TERMINAL_PARAMETER_NAMES) - set(named_parameters)
-    if absent_terminal:
-        raise ParameterGroupingError(f"expected terminal prediction weights are absent: {sorted(absent_terminal)}")
-
-    frozen_terminal = [name for name in AMUSE_TERMINAL_PARAMETER_NAMES if not named_parameters[name].requires_grad]
-    if frozen_terminal:
-        raise ParameterGroupingError(f"terminal prediction weights must be trainable: {frozen_terminal}")
+    legacy_model = any(name.startswith("camera_head.") for name in named_parameters)
+    if legacy_model:
+        absent_terminal = set(AMUSE_TERMINAL_PARAMETER_NAMES) - set(named_parameters)
+        if absent_terminal:
+            raise ParameterGroupingError(f"expected terminal prediction weights are absent: {sorted(absent_terminal)}")
+        frozen_terminal = [name for name in AMUSE_TERMINAL_PARAMETER_NAMES if not named_parameters[name].requires_grad]
+        if frozen_terminal:
+            raise ParameterGroupingError(f"terminal prediction weights must be trainable: {frozen_terminal}")
 
     muon_names: list[str] = []
     fallback_names: list[str] = []
@@ -132,10 +160,10 @@ def classify_amuse_parameters(model: torch.nn.Module) -> AmuseParameterGrouping:
             continue
         if not name.startswith(_TRAINABLE_PREFIXES):
             raise ParameterGroupingError(f"trainable parameter outside camera_head/dense_head is not supported: {name}")
-        if name.startswith(_CONFIDENCE_PREFIX):
+        if name.startswith(_CONFIDENCE_PREFIXES):
             raise ParameterGroupingError(f"confidence projection must remain frozen: {name}")
 
-        if name in AMUSE_TERMINAL_PARAMETER_NAMES or parameter.ndim < 2:
+        if name.endswith(_TERMINAL_PARAMETER_SUFFIXES) or parameter.ndim < 2:
             fallback_names.append(name)
         elif parameter.ndim in {2, 4}:
             muon_names.append(name)

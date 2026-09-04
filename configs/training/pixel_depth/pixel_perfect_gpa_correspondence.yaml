@@ -1,0 +1,125 @@
+enabled: true
+semantic_input_dim: 2048
+refiner:
+  hidden_dim: 128
+  depth: 4
+  num_heads: 4
+  coarse_patch_size: 16
+  fine_patch_size: 8
+temporal:
+  enabled: true
+  hidden_dim: 128
+  num_heads: 4
+  depth: 2
+  reference_mode: random_valid
+  preserve_frame_order: true
+geometry:
+  enabled: true
+  occlusion_mask: true
+  dynamic_mask: true
+  invalid_mask: true
+  max_depth_m: 1.2
+  relative_depth_tolerance: 0.03
+flow:
+  log_residual_scale: 1.0
+  gradient_loss_weight: 0.2
+  objective_weight: 1.0
+  edge_objective_weight: 0.5
+  multiview_objective_weight: 0.5
+  time_sampling: logit_normal
+  ode_steps: 4
+  seed_offset: 10000
+  residual_gate_initial: 0.0
+optimization:
+  train_base_heads: true
+self_supervised:
+  gpa:
+    enabled: true
+    mu: 0.85
+    lambda_geo: 0.1
+    lambda_smooth: 0.001
+    auto_mask_delta: 0.0
+    geometry_epsilon: 1.0e-6
+    auto_mask_enabled: true
+    mask_mode: intersection
+    anchor_count: 3
+  correspondence:
+    enabled: true
+    hidden_dim: 256
+    pair_chunk_size: 2
+    alpha: 0.5
+    epsilon: 0.01
+    relative_depth_tolerance: 0.03
+  guardrail:
+    enabled: true
+    metrics:
+      near_depth_mae_m:
+        max_relative_degradation: 0.10
+        max_absolute_degradation: 0.01
+      camera_translation:
+        max_relative_degradation: 0.10
+        max_absolute_degradation: 0.01
+      objective:
+        max_relative_degradation: 0.10
+        max_absolute_degradation: 0.02
+  curriculum:
+    - name: baseline_parity
+      start_epoch: 0
+      train_enabled: false
+      train_refiner: false
+      train_correspondence: false
+      train_base_heads: false
+      flow_weight: 0.0
+      gpa_weight: 0.0
+      correspondence_weight: 0.0
+      learning_rate_scale: 0.0
+    - name: residual_gate
+      start_epoch: 1
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: false
+      train_base_heads: false
+      flow_weight: 1.0
+      gpa_weight: 0.0
+      correspondence_weight: 0.0
+      learning_rate_scale: 1.0
+    - name: gpa_warmup
+      start_epoch: 2
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: false
+      train_base_heads: true
+      flow_weight: 0.5
+      gpa_weight: 0.1
+      correspondence_weight: 0.0
+      learning_rate_scale: 0.5
+    - name: correspondence_head
+      start_epoch: 3
+      train_enabled: true
+      train_refiner: false
+      train_correspondence: true
+      train_base_heads: false
+      flow_weight: 0.0
+      gpa_weight: 0.0
+      correspondence_weight: 1.0
+      learning_rate_scale: 0.5
+    - name: joint_low_lr
+      start_epoch: 4
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: true
+      train_base_heads: true
+      flow_weight: 0.5
+      gpa_weight: 0.1
+      correspondence_weight: 0.1
+      learning_rate_scale: 0.2
+    - name: near_depth_recovery
+      start_epoch: 5
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: false
+      train_base_heads: true
+      flow_weight: 0.25
+      gpa_weight: 0.0
+      correspondence_weight: 0.0
+      learning_rate_scale: 0.2

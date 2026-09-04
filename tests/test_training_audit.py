@@ -231,6 +231,22 @@ def test_audit_rejects_run_that_did_not_finish_configured_epochs(tmp_path: Path)
     assert "run_epoch_count_mismatch" in _error_codes(report)
 
 
+def test_audit_accepts_epoch_short_run_at_exact_global_step_limit(tmp_path: Path) -> None:
+    run_dir = _make_valid_run(tmp_path)
+    config_path = run_dir / "resolved_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["trainer"].update({"epochs": 6, "max_train_steps": 1})
+    _write_json(config_path, config)
+    summary_path = run_dir / "run_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["epochs_completed"] = 2
+    _write_json(summary_path, summary)
+
+    report = audit_training_artifacts(run_dir, report_path=tmp_path / "audit.json")
+
+    assert "run_epoch_count_mismatch" not in _error_codes(report)
+
+
 def test_audit_accepts_valid_early_stopped_run(tmp_path: Path) -> None:
     run_dir = _make_valid_run(tmp_path)
     config_path = run_dir / "resolved_config.json"

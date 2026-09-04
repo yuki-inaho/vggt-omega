@@ -1,0 +1,6 @@
+name: topk_near_edge
+k: 3
+monitor: val/near_edge_objective
+mode: min
+save_last: true
+directory: checkpoints

@@ -1,0 +1,21 @@
+compile:
+  enabled: true
+  backend: inductor
+  mode: default
+  fullgraph: false
+  dynamic: false
+  targets:
+    - semantic_adapter
+    - temporal_mixer
+    - refiner
+    - correspondence_head
+data_loader:
+  prefetch_factor: 2
+  persistent_workers: true
+profiling:
+  enabled: true
+  warmup_steps: 1
+  active_steps: 4
+runtime_contracts:
+  enabled: true
+  first_batch_only: true

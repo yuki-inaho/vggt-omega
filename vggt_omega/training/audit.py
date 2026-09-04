@@ -235,20 +235,26 @@ def _audit_summary(
             state.error("summary", "initial_head_invalid")
         trainer_config = _nested_mapping(config, "trainer")
         expected_epochs = trainer_config.get("epochs") if trainer_config else None
+        max_train_steps = trainer_config.get("max_train_steps") if trainer_config else None
         completed_epochs = summary.get("epochs_completed")
+        global_step = summary.get("global_step")
         stopped_early = summary.get("stopped_early", False)
+        valid_epoch_window = (
+            _is_nonnegative_integer(expected_epochs)
+            and _is_nonnegative_integer(completed_epochs)
+            and 0 < cast(int, completed_epochs) <= cast(int, expected_epochs)
+        )
+        completed_by_step_limit = (
+            _is_nonnegative_integer(max_train_steps)
+            and cast(int, max_train_steps) > 0
+            and global_step == max_train_steps
+            and valid_epoch_window
+        )
         if (
             not _is_nonnegative_integer(expected_epochs)
             or not isinstance(stopped_early, bool)
-            or (not stopped_early and completed_epochs != expected_epochs)
-            or (
-                stopped_early
-                and (
-                    not _is_nonnegative_integer(completed_epochs)
-                    or cast(int, completed_epochs) < 1
-                    or cast(int, completed_epochs) > cast(int, expected_epochs)
-                )
-            )
+            or (not stopped_early and completed_epochs != expected_epochs and not completed_by_step_limit)
+            or (stopped_early and not valid_epoch_window)
         ):
             state.error("summary", "run_epoch_count_mismatch")
         configured_early = _nested_mapping(trainer_config, "early_stopping")

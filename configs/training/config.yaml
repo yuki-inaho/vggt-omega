@@ -1,12 +1,15 @@
 defaults:
   - data: colmap_rgbd
   - model: omega_1b_512
+  - pixel_depth: disabled
+  - dynamic_geometry: disabled
   - optimizer: amuse
   - loss: standard
   - trainer: smoke
   - checkpoint: topk
   - logging: tensorboard
   - renderer: soft
+  - performance: default
   - _self_
 
 seed: 42
