@@ -176,6 +176,51 @@ def test_compute_camera_depth_loss_applies_fixed_objective_weights() -> None:
     assert losses["objective"].item() == pytest.approx(26.0)
 
 
+def test_compute_camera_depth_loss_masks_depth_in_metric_space() -> None:
+    extrinsics, intrinsics, image_size = _known_camera()
+    pose_target = build_camera_pose_target(extrinsics, intrinsics, image_size)
+    batch = {
+        "images": torch.zeros(1, 1, 3, *image_size),
+        "depths": torch.tensor([[[[1.0, 3.0]]]]),
+        "depth_masks": torch.tensor([[[[True, True]]]]),
+        "extrinsics": extrinsics,
+        "intrinsics": intrinsics,
+        "normalization_scale_m": torch.tensor(0.5),
+    }
+    depth_prediction = torch.tensor([[[[[2.0], [0.0]]]]], requires_grad=True)
+
+    losses = compute_camera_depth_loss(
+        {"pose_enc": pose_target, "depth": depth_prediction},
+        batch,
+        max_metric_depth_m=1.2,
+    )
+
+    assert losses["depth"].item() == pytest.approx(1.0)
+    losses["objective"].backward()
+    assert depth_prediction.grad is not None
+    assert depth_prediction.grad[0, 0, 0, 0, 0].item() != 0.0
+    assert depth_prediction.grad[0, 0, 0, 1, 0].item() == 0.0
+
+
+def test_metric_depth_mask_requires_normalization_scale() -> None:
+    extrinsics, intrinsics, image_size = _known_camera()
+    pose_target = build_camera_pose_target(extrinsics, intrinsics, image_size)
+    batch = {
+        "images": torch.zeros(1, 1, 3, *image_size),
+        "depths": torch.ones(1, 1, 1, 1),
+        "depth_masks": torch.ones(1, 1, 1, 1, dtype=torch.bool),
+        "extrinsics": extrinsics,
+        "intrinsics": intrinsics,
+    }
+
+    with pytest.raises(KeyError, match="normalization_scale_m"):
+        compute_camera_depth_loss(
+            {"pose_enc": pose_target, "depth": torch.ones(1, 1, 1, 1, 1)},
+            batch,
+            max_metric_depth_m=1.2,
+        )
+
+
 @pytest.mark.parametrize("which", ["pose", "depth", "target_depth"])
 def test_losses_reject_nonfinite_values(which: str) -> None:
     extrinsics, intrinsics, image_size = _known_camera()

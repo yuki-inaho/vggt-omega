@@ -25,17 +25,28 @@ def _parser() -> argparse.ArgumentParser:
         default=1e-4,
         help="Maximum absolute difference between stored and recomputed val/objective",
     )
+    parser.add_argument(
+        "--depth-threshold-m",
+        action="append",
+        type=float,
+        default=None,
+        help="Repeatable metric-depth upper bound in meters (default: 0.4, 0.8, 1.2)",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    evaluation_options = {}
+    if args.depth_threshold_m is not None:
+        evaluation_options["depth_thresholds_m"] = tuple(args.depth_threshold_m)
     report = evaluate_training_checkpoints(
         args.run_dir,
         output_path=args.output,
         original_cwd=args.original_cwd,
         device=args.device,
         tolerance=args.tolerance,
+        **evaluation_options,
     )
     print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
     return 0

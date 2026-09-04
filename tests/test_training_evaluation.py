@@ -567,3 +567,31 @@ def test_evaluation_cli_passes_all_arguments_and_prints_report(
         "tolerance": 0.125,
     }
     assert json.loads(capsys.readouterr().out) == expected
+
+
+def test_evaluation_cli_passes_explicit_depth_thresholds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_evaluate(run_dir: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"format_version": 1, "status": "passed"}
+
+    monkeypatch.setattr("scripts.evaluate_training_checkpoints.evaluate_training_checkpoints", fake_evaluate)
+    assert (
+        evaluation_cli_main(
+            [
+                "--run-dir",
+                str(tmp_path / "run"),
+                "--output",
+                str(tmp_path / "result.json"),
+                "--original-cwd",
+                str(tmp_path / "repo"),
+                "--depth-threshold-m",
+                "0.6",
+                "--depth-threshold-m",
+                "1.2",
+            ]
+        )
+        == 0
+    )
+    assert captured["depth_thresholds_m"] == (0.6, 1.2)

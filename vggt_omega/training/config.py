@@ -37,6 +37,13 @@ def _validate_loss_weights(value: object, owner: str) -> None:
         weight = float(raw_weight)
         if not math.isfinite(weight) or weight < 0:
             raise ValueError(f"{owner}.{key} must be a finite non-negative number")
+    raw_max_depth = weights.get("max_metric_depth_m")
+    if raw_max_depth is not None:
+        if isinstance(raw_max_depth, bool) or not isinstance(raw_max_depth, (int, float)):
+            raise ValueError(f"{owner}.max_metric_depth_m must be a finite positive number or null")
+        max_depth = float(raw_max_depth)
+        if not math.isfinite(max_depth) or max_depth <= 0:
+            raise ValueError(f"{owner}.max_metric_depth_m must be a finite positive number or null")
 
 
 def validate_training_config(cfg: DictConfig) -> None:

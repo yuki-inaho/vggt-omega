@@ -134,6 +134,43 @@ def test_validate_one_epoch_is_finite_and_does_not_create_gradients() -> None:
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
+def test_validate_one_epoch_reports_metric_depth_threshold_metrics() -> None:
+    model = _TinyCameraDepthModel()
+    batch = _batch()
+    batch["normalization_scale_m"] = torch.tensor(1.0)
+    batch["depths"][..., :8, :] = 0.5
+    batch["depths"][..., 8:, :] = 1.25
+
+    metrics = validate_one_epoch(
+        model=model,
+        batches=[batch],
+        device=torch.device("cpu"),
+        min_valid_depth_pixels=1,
+        depth_thresholds_m=(1.2,),
+    )
+
+    expected_prediction = math.exp(0.25)
+    assert metrics["depth_lt_1p2m_valid_pixels"] == 256
+    assert metrics["depth_lt_1p2m_coverage"] == pytest.approx(0.5)
+    assert metrics["depth_lt_1p2m_mae_m"] == pytest.approx(expected_prediction - 0.5)
+    assert metrics["depth_lt_1p2m_rmse_m"] == pytest.approx(expected_prediction - 0.5)
+    assert metrics["depth_lt_1p2m_abs_rel"] == pytest.approx((expected_prediction - 0.5) / 0.5)
+    assert metrics["depth_lt_1p2m_normalized_l1"] == pytest.approx(expected_prediction - 0.5)
+    assert metrics["depth_all_valid_pixels"] == 512
+    assert metrics["depth_all_coverage"] == 1.0
+
+
+def test_validate_one_epoch_rejects_invalid_depth_thresholds() -> None:
+    with pytest.raises(ValueError, match="depth thresholds"):
+        validate_one_epoch(
+            model=_TinyCameraDepthModel(),
+            batches=[_batch()],
+            device=torch.device("cpu"),
+            min_valid_depth_pixels=1,
+            depth_thresholds_m=(1.2, 0.8),
+        )
+
+
 def test_train_one_epoch_rejects_nonfinite_loss_without_stepping() -> None:
     model = _TinyCameraDepthModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)

@@ -58,6 +58,16 @@ def test_translation_focus_early_stopping_config_validates() -> None:
     assert cfg.trainer.early_stopping.patience == 2
 
 
+def test_near_depth_focus_config_validates() -> None:
+    cfg = _compose("loss=near_depth_focus", "trainer=finetune", "trainer.epochs=5")
+
+    validate_training_config(cfg)
+
+    assert cfg.loss.training.max_metric_depth_m == pytest.approx(1.2)
+    assert cfg.loss.validation.max_metric_depth_m == pytest.approx(1.2)
+    assert cfg.loss.training.depth_weight == pytest.approx(4.0)
+
+
 def test_early_stopping_monitor_must_match_checkpoint_monitor() -> None:
     cfg = _compose("trainer=finetune", "trainer.early_stopping.enabled=true")
     cfg.trainer.early_stopping.monitor = "val/camera_translation"

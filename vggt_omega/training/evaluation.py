@@ -8,7 +8,8 @@ import json
 import math
 import os
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -488,6 +489,14 @@ def _validation_loss_options(config: Mapping[str, Any]) -> dict[str, float] | No
         options[key] = _finite_float(validation.get(key), f"loss.validation.{key}")
         if options[key] < 0:
             raise EvaluationError(f"loss.validation.{key} must be non-negative")
+    max_metric_depth_m = validation.get("max_metric_depth_m")
+    if max_metric_depth_m is not None:
+        options["max_metric_depth_m"] = _finite_float(
+            max_metric_depth_m,
+            "loss.validation.max_metric_depth_m",
+        )
+        if options["max_metric_depth_m"] <= 0:
+            raise EvaluationError("loss.validation.max_metric_depth_m must be positive")
     return options
 
 
@@ -589,6 +598,7 @@ def evaluate_training_checkpoints(
     original_cwd: str | os.PathLike[str],
     device: str | torch.device = "cuda",
     tolerance: float = 1e-4,
+    depth_thresholds_m: Iterable[float] = (0.4, 0.8, 1.2),
     model_factory: ModelFactory | None = None,
     dataset_factory: DatasetFactory | None = None,
     validator: Validator | None = None,
@@ -605,6 +615,17 @@ def evaluate_training_checkpoints(
     tolerance_value = float(tolerance)
     if not math.isfinite(tolerance_value) or tolerance_value < 0:
         raise ValueError("tolerance must be a finite non-negative number")
+    thresholds_m: list[float] = []
+    for value in depth_thresholds_m:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("depth thresholds must be finite positive numbers in strictly increasing order")
+        threshold = float(value)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("depth thresholds must be finite positive numbers in strictly increasing order")
+        thresholds_m.append(threshold)
+    if not thresholds_m or any(left >= right for left, right in pairwise(thresholds_m)):
+        raise ValueError("depth thresholds must be finite positive numbers in strictly increasing order")
+    validated_thresholds_m = tuple(thresholds_m)
 
     run_root = Path(run_dir).expanduser().resolve()
     cwd = Path(original_cwd).expanduser().resolve()
@@ -745,6 +766,7 @@ def evaluate_training_checkpoints(
                 max_batches=validation_options["max_batches"],
                 precision="bf16",
                 loss_options=validation_loss_options,
+                depth_thresholds_m=validated_thresholds_m,
             )
         )
         if metric_key not in metrics:
@@ -775,6 +797,7 @@ def evaluate_training_checkpoints(
         "tolerance": tolerance_value,
         "validation": {
             "checkpoint_count": len(checkpoint_reports),
+            "depth_thresholds_m": list(validated_thresholds_m),
             "max_batches": validation_options["max_batches"],
             "precision": "bf16",
             "sample_count": len(dataset),

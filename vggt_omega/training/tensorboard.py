@@ -8,6 +8,21 @@ from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter
 
+_DEPTH_EVALUATION_PREFIXES = (
+    "depth_all",
+    "depth_lt_0p4m",
+    "depth_lt_0p8m",
+    "depth_lt_1p2m",
+)
+_DEPTH_EVALUATION_SUFFIXES = (
+    "abs_rel",
+    "coverage",
+    "mae_m",
+    "normalized_l1",
+    "rmse_m",
+    "valid_pixels",
+)
+
 ALLOWED_SCALAR_TAGS = frozenset(
     {
         "train/objective",
@@ -27,6 +42,11 @@ ALLOWED_SCALAR_TAGS = frozenset(
         "val/camera_fov",
         "val/depth",
         "system/max_cuda_memory_gib",
+    }
+    | {
+        f"val/{prefix}_{suffix}"
+        for prefix in _DEPTH_EVALUATION_PREFIXES
+        for suffix in _DEPTH_EVALUATION_SUFFIXES
     }
 )
 

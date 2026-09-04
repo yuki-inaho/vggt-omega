@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -83,10 +84,15 @@ _STANDARD_EARLY_STOPPING_CONFIG = {
     "patience": 2,
     "min_delta": 0.0,
 }
+_DEFAULT_DEPTH_EVALUATION_THRESHOLDS_M = (0.4, 0.8, 1.2)
 
 
 def _loss_options(value: Mapping[str, Any]) -> dict[str, float]:
-    return {key: float(value[key]) for key in _LOSS_WEIGHT_KEYS}
+    options = {key: float(value[key]) for key in _LOSS_WEIGHT_KEYS}
+    max_metric_depth_m = value.get("max_metric_depth_m")
+    if max_metric_depth_m is not None:
+        options["max_metric_depth_m"] = float(max_metric_depth_m)
+    return options
 
 
 def _training_loss_options(cfg: DictConfig, epoch: int) -> dict[str, float]:
@@ -246,6 +252,124 @@ def _mean_metrics(totals: Mapping[str, float], batches: int) -> dict[str, float]
     return {name: value / batches for name, value in totals.items()}
 
 
+def _validated_depth_thresholds_m(values: Iterable[float]) -> tuple[float, ...]:
+    thresholds: list[float] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("depth thresholds must be finite positive numbers in strictly increasing order")
+        threshold = float(value)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("depth thresholds must be finite positive numbers in strictly increasing order")
+        thresholds.append(threshold)
+    if not thresholds or any(left >= right for left, right in pairwise(thresholds)):
+        raise ValueError("depth thresholds must be finite positive numbers in strictly increasing order")
+    return tuple(thresholds)
+
+
+def _depth_threshold_label(threshold_m: float) -> str:
+    return format(threshold_m, ".9g").replace(".", "p")
+
+
+def _empty_depth_metric_totals() -> dict[str, float]:
+    return {
+        "absolute_error_m": 0.0,
+        "absolute_relative_error": 0.0,
+        "normalized_absolute_error": 0.0,
+        "squared_error_m2": 0.0,
+        "valid_pixels": 0.0,
+    }
+
+
+def _accumulate_depth_scope(
+    totals: dict[str, float],
+    *,
+    scope_mask: torch.Tensor,
+    absolute_error_m: torch.Tensor,
+    absolute_relative_error: torch.Tensor,
+    normalized_absolute_error: torch.Tensor,
+) -> None:
+    count = int(scope_mask.sum().item())
+    if count == 0:
+        return
+    totals["valid_pixels"] += count
+    totals["absolute_error_m"] += float(absolute_error_m[scope_mask].double().sum())
+    totals["squared_error_m2"] += float(absolute_error_m[scope_mask].double().square().sum())
+    totals["absolute_relative_error"] += float(absolute_relative_error[scope_mask].double().sum())
+    totals["normalized_absolute_error"] += float(normalized_absolute_error[scope_mask].double().sum())
+
+
+def _accumulate_metric_depth_metrics(
+    totals: dict[str, dict[str, float]],
+    *,
+    predictions: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    thresholds_m: tuple[float, ...],
+) -> bool:
+    scale = batch.get("normalization_scale_m")
+    if scale is None:
+        return False
+    if not isinstance(scale, torch.Tensor):
+        raise TypeError("normalization_scale_m must be a tensor")
+    target_depth = cast(torch.Tensor, batch["depths"])
+    depth_mask = cast(torch.Tensor, batch["depth_masks"])
+    predicted_depth = predictions["depth"][..., 0]
+    batch_size = int(target_depth.shape[0])
+    if scale.numel() != batch_size:
+        raise ValueError("normalization_scale_m must contain exactly one scale per sample")
+    scale = scale.to(device=target_depth.device, dtype=torch.float64).reshape(batch_size, 1, 1, 1)
+    if not torch.isfinite(scale).all() or torch.any(scale <= 0):
+        raise ValueError("normalization_scale_m must contain finite positive values")
+
+    target = target_depth.to(dtype=torch.float64)
+    prediction = predicted_depth.to(dtype=torch.float64)
+    target_metric_m = target * scale
+    normalized_absolute_error = (prediction - target).abs()
+    absolute_error_m = normalized_absolute_error * scale
+    valid = depth_mask & (target_metric_m > 0)
+    absolute_relative_error = absolute_error_m / target_metric_m.clamp_min(torch.finfo(torch.float64).eps)
+    _accumulate_depth_scope(
+        totals["all"],
+        scope_mask=valid,
+        absolute_error_m=absolute_error_m,
+        absolute_relative_error=absolute_relative_error,
+        normalized_absolute_error=normalized_absolute_error,
+    )
+    for threshold_m in thresholds_m:
+        _accumulate_depth_scope(
+            totals[_depth_threshold_label(threshold_m)],
+            scope_mask=valid & (target_metric_m < threshold_m),
+            absolute_error_m=absolute_error_m,
+            absolute_relative_error=absolute_relative_error,
+            normalized_absolute_error=normalized_absolute_error,
+        )
+    return True
+
+
+def _finalize_metric_depth_metrics(
+    totals: Mapping[str, Mapping[str, float]], thresholds_m: tuple[float, ...]
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    all_count = float(totals["all"]["valid_pixels"])
+    if all_count <= 0:
+        raise ValueError("metric depth evaluation received no valid pixels")
+    scopes = (("all", "depth_all"),) + tuple(
+        (_depth_threshold_label(threshold), f"depth_lt_{_depth_threshold_label(threshold)}m")
+        for threshold in thresholds_m
+    )
+    for scope, prefix in scopes:
+        scope_totals = totals[scope]
+        count = float(scope_totals["valid_pixels"])
+        metrics[f"{prefix}_valid_pixels"] = count
+        metrics[f"{prefix}_coverage"] = count / all_count
+        if count == 0:
+            continue
+        metrics[f"{prefix}_mae_m"] = scope_totals["absolute_error_m"] / count
+        metrics[f"{prefix}_rmse_m"] = math.sqrt(scope_totals["squared_error_m2"] / count)
+        metrics[f"{prefix}_abs_rel"] = scope_totals["absolute_relative_error"] / count
+        metrics[f"{prefix}_normalized_l1"] = scope_totals["normalized_absolute_error"] / count
+    return metrics
+
+
 def _take_optimizer_step(
     *,
     model: nn.Module,
@@ -379,13 +503,20 @@ def validate_one_epoch(
     max_batches: int | None = None,
     precision: str = "fp32",
     loss_options: Mapping[str, float] | None = None,
+    depth_thresholds_m: Iterable[float] = _DEFAULT_DEPTH_EVALUATION_THRESHOLDS_M,
 ) -> dict[str, float]:
     """Evaluate one epoch using the model weights currently exposed by the optimizer."""
 
     if max_batches is not None and max_batches < 1:
         raise ValueError("max_batches must be None or at least 1")
+    thresholds_m = _validated_depth_thresholds_m(depth_thresholds_m)
     model.eval()
     totals: dict[str, float] = {}
+    metric_depth_totals = {
+        "all": _empty_depth_metric_totals(),
+        **{_depth_threshold_label(threshold): _empty_depth_metric_totals() for threshold in thresholds_m},
+    }
+    metric_depth_available: bool | None = None
     batch_count = 0
     for raw_batch in batches:
         batch = _move_batch(raw_batch, device)
@@ -399,10 +530,22 @@ def validate_one_epoch(
             )
         _ensure_finite_loss(losses)
         _accumulate_metrics(totals, losses)
+        has_metric_depth = _accumulate_metric_depth_metrics(
+            metric_depth_totals,
+            predictions=predictions,
+            batch=batch,
+            thresholds_m=thresholds_m,
+        )
+        if metric_depth_available is not None and metric_depth_available != has_metric_depth:
+            raise ValueError("normalization_scale_m must be present consistently across validation batches")
+        metric_depth_available = has_metric_depth
         batch_count += 1
         if max_batches is not None and batch_count >= max_batches:
             break
-    return _mean_metrics(totals, batch_count)
+    metrics = _mean_metrics(totals, batch_count)
+    if metric_depth_available:
+        metrics.update(_finalize_metric_depth_metrics(metric_depth_totals, thresholds_m))
+    return metrics
 
 
 def _resolve_path(value: str | os.PathLike[str], original_cwd: Path) -> Path:
@@ -912,14 +1055,7 @@ def run_training(
                         precision=str(cfg.model.precision),
                         loss_options=_loss_options(cfg.loss.validation),
                     )
-                    validation_scalars = {
-                        "val/objective": latest_val["objective"],
-                        "val/camera": latest_val["camera"],
-                        "val/camera_translation": latest_val["camera_translation"],
-                        "val/camera_rotation": latest_val["camera_rotation"],
-                        "val/camera_fov": latest_val["camera_fov"],
-                        "val/depth": latest_val["depth"],
-                    }
+                    validation_scalars = {f"val/{name}": value for name, value in latest_val.items()}
                     logger.log_scalars(validation_scalars, step=global_step)
                     if early_enabled:
                         monitored_value = float(validation_scalars[early_monitor])

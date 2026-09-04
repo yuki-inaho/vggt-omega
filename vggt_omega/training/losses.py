@@ -115,6 +115,7 @@ def compute_camera_depth_loss(
     rotation_weight: float = 1.0,
     fov_weight: float = 0.5,
     min_valid_depth_pixels: int = 1,
+    max_metric_depth_m: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the fixed weighted camera/depth objective for one normalized batch."""
 
@@ -131,6 +132,27 @@ def compute_camera_depth_loss(
     _validate_nonnegative_finite_weight("camera_weight", camera_weight)
     _validate_nonnegative_finite_weight("depth_weight", depth_weight)
 
+    effective_depth_mask = depth_mask
+    if max_metric_depth_m is not None:
+        if (
+            isinstance(max_metric_depth_m, bool)
+            or not isinstance(max_metric_depth_m, (int, float))
+            or not math.isfinite(float(max_metric_depth_m))
+            or max_metric_depth_m <= 0
+        ):
+            raise ValueError("max_metric_depth_m must be a finite positive number or None")
+        normalization_scale = _require_mapping_tensor(batch, "normalization_scale_m", "batch")
+        batch_size = int(target_depth.shape[0])
+        if normalization_scale.numel() != batch_size:
+            raise ValueError("normalization_scale_m must contain exactly one scale per sample")
+        normalization_scale = normalization_scale.to(device=target_depth.device, dtype=target_depth.dtype).reshape(
+            batch_size, 1, 1, 1
+        )
+        _require_finite("normalization_scale_m", normalization_scale)
+        if torch.any(normalization_scale <= 0):
+            raise ValueError("normalization_scale_m must contain positive values")
+        effective_depth_mask = depth_mask & (target_depth * normalization_scale < float(max_metric_depth_m))
+
     camera_losses = compute_camera_loss(
         predicted_pose,
         extrinsics,
@@ -143,7 +165,7 @@ def compute_camera_depth_loss(
     depth = compute_depth_loss(
         predicted_depth,
         target_depth,
-        depth_mask,
+        effective_depth_mask,
         min_valid_pixels=min_valid_depth_pixels,
     )
     objective = float(camera_weight) * camera_losses["camera"] + float(depth_weight) * depth
