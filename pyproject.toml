@@ -39,6 +39,10 @@ viz = [
 rgbd = [
     "matplotlib>=3.7",
 ]
+training = [
+    "hydra-core>=1.3.6,<1.4",
+    "tensorboard>=2.21,<3",
+]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -63,7 +67,15 @@ dev = [
 [tool.ruff]
 line-length = 120
 target-version = "py310"
-extend-exclude = [".venv", "build", "dist", "checkpoints", "demo_outputs", "outputs"]
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "checkpoints",
+    "demo_outputs",
+    "outputs",
+    "vggt_omega/training/optim/amuse.py",
+]
 
 [tool.ruff.lint]
 select = [

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 
-from vggt_omega.pipeline import SceneResult, _predictions_to_scene_result, autodetect_device
+from vggt_omega.pipeline import SceneResult, VGGTOmegaPipeline, _predictions_to_scene_result, autodetect_device
 
 
 def _fake_predictions(num_frames: int = 2, h: int = 16, w: int = 24) -> dict:
@@ -75,10 +78,84 @@ def test_autodetect_device_returns_torch_device() -> None:
     assert dev.type in {"cuda", "cpu"}
 
 
+class _TinyDenseHead(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.trunk = torch.nn.Linear(2, 2)
+        self.proj = torch.nn.Linear(2, 1)
+        self.proj_conf = torch.nn.Linear(2, 1)
+
+
+class _TinyOmega(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.aggregator = torch.nn.Linear(2, 2)
+        self.camera_head = torch.nn.Linear(2, 2)
+        self.dense_head = _TinyDenseHead()
+
+
+def _head_payload(model: torch.nn.Module, base_path: Path) -> dict:
+    names = {
+        name
+        for name, _ in model.named_parameters()
+        if (name.startswith("camera_head.") or name.startswith("dense_head."))
+        and not name.startswith("dense_head.proj_conf.")
+    }
+    state = {name: torch.full_like(model.state_dict()[name], 7) for name in names}
+    return {
+        "format_version": 1,
+        "kind": "best",
+        "parameter_state": "x",
+        "model_state": state,
+        "metadata": {
+            "base_checkpoint": {
+                "size_bytes": base_path.stat().st_size,
+                "sha256": hashlib.sha256(base_path.read_bytes()).hexdigest(),
+            }
+        },
+        "config": {"model": {"image_height": 384, "image_width": 512}},
+    }
+
+
+def test_pipeline_strictly_overlays_head_and_reads_training_shape(tmp_path: Path) -> None:
+    model = _TinyOmega()
+    original_aggregator = model.aggregator.weight.detach().clone()
+    original_confidence = model.dense_head.proj_conf.weight.detach().clone()
+    base_path = tmp_path / "base.pt"
+    base_path.write_bytes(b"released base")
+    head_path = tmp_path / "best.pt"
+    torch.save(_head_payload(model, base_path), head_path)
+
+    shape = VGGTOmegaPipeline._apply_head_checkpoint(model, head_path, base_path)
+
+    assert shape == (384, 512)
+    assert torch.equal(model.aggregator.weight, original_aggregator)
+    assert torch.equal(model.dense_head.proj_conf.weight, original_confidence)
+    assert torch.equal(model.camera_head.weight, torch.full_like(model.camera_head.weight, 7))
+    assert torch.equal(model.dense_head.proj.weight, torch.full_like(model.dense_head.proj.weight, 7))
+
+
+def test_pipeline_rejects_incomplete_or_wrong_base_head(tmp_path: Path) -> None:
+    model = _TinyOmega()
+    base_path = tmp_path / "base.pt"
+    base_path.write_bytes(b"released base")
+    payload = _head_payload(model, base_path)
+    payload["model_state"].pop("camera_head.weight")
+    head_path = tmp_path / "best.pt"
+    torch.save(payload, head_path)
+
+    with pytest.raises(ValueError, match="exactly match"):
+        VGGTOmegaPipeline._apply_head_checkpoint(model, head_path, base_path)
+
+    payload = _head_payload(model, base_path)
+    payload["metadata"]["base_checkpoint"]["sha256"] = "0" * 64
+    torch.save(payload, head_path)
+    with pytest.raises(ValueError, match="different base"):
+        VGGTOmegaPipeline._apply_head_checkpoint(model, head_path, base_path)
+
+
 @pytest.mark.gpu
 def test_pipeline_run_smoke() -> None:
-    from pathlib import Path
-
     from vggt_omega.pipeline import VGGTOmegaPipeline
     from vggt_omega.preprocess import preprocess_images, read_images_from_video
 

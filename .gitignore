@@ -40,3 +40,9 @@ predictions.npz
 *.pt
 *.pth
 *.safetensors
+
+# Local working documents and scratch output
+temp/
+
+# Operational documentation is kept outside this repository
+docs/

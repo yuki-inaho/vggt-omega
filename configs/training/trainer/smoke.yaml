@@ -1,0 +1,19 @@
+name: smoke
+strategy: single
+device: cuda
+epochs: 1
+max_train_steps: 3
+max_val_batches: 1
+gradient_accumulation_steps: 1
+gradient_clip_norm: 1.0
+validate_every_epochs: 1
+log_every_steps: 1
+deterministic: true
+resume_from: null
+sequence_frames: 2
+early_stopping:
+  enabled: false
+  monitor: val/objective
+  mode: min
+  patience: 2
+  min_delta: 0.0

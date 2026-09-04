@@ -21,7 +21,7 @@ from PIL import Image
 
 from .utils.load_fn import load_and_preprocess_images
 
-PreprocessMode = Literal["balanced", "max_size"]
+PreprocessMode = Literal["balanced", "max_size", "fixed"]
 
 
 def load_images_from_paths(
@@ -29,6 +29,8 @@ def load_images_from_paths(
     image_resolution: int = 512,
     mode: PreprocessMode = "balanced",
     patch_size: int = 16,
+    target_height: int | None = None,
+    target_width: int | None = None,
 ) -> Float[torch.Tensor, "n_img 3 h w"]:
     """Thin wrapper over the legacy path-based loader for API parity."""
     paths = [str(p) for p in image_paths]
@@ -37,6 +39,8 @@ def load_images_from_paths(
         mode=mode,
         image_resolution=image_resolution,
         patch_size=patch_size,
+        target_height=target_height,
+        target_width=target_width,
     )
 
 
@@ -85,6 +89,8 @@ def preprocess_images(
     mode: PreprocessMode = "balanced",
     patch_size: int = 16,
     tmp_dir: str | Path | None = None,
+    target_height: int | None = None,
+    target_width: int | None = None,
 ) -> Float[torch.Tensor, "n_img 3 h w"]:
     """Preprocess a list of HxWx3 uint8/float RGB arrays into the model tensor.
 
@@ -96,8 +102,16 @@ def preprocess_images(
         raise ValueError("preprocess_images requires at least one image")
 
     if tmp_dir is not None:
-        return _preprocess_via_disk(images, image_resolution, mode, patch_size, Path(tmp_dir))
-    return _preprocess_in_memory(images, image_resolution, mode, patch_size)
+        return _preprocess_via_disk(
+            images,
+            image_resolution,
+            mode,
+            patch_size,
+            Path(tmp_dir),
+            target_height,
+            target_width,
+        )
+    return _preprocess_in_memory(images, image_resolution, mode, patch_size, target_height, target_width)
 
 
 def _preprocess_in_memory(
@@ -105,15 +119,19 @@ def _preprocess_in_memory(
     image_resolution: int,
     mode: PreprocessMode,
     patch_size: int,
+    target_height: int | None,
+    target_width: int | None,
 ) -> torch.Tensor:
     """Run the same resize logic as :mod:`load_fn` without touching disk."""
     from torchvision import transforms as TF
 
     from .utils.load_fn import (
         _balanced_target_shape,
+        _crop_to_aspect_ratio,
         _crop_to_supported_aspect_ratio,
         _max_size_target_shape,
         _pad_images_to_common_size,
+        _validate_fixed_target,
     )
 
     if image_resolution <= 0:
@@ -122,23 +140,27 @@ def _preprocess_in_memory(
         raise ValueError("patch_size must be positive")
     if image_resolution % patch_size != 0:
         raise ValueError("image_resolution must be divisible by patch_size")
-    if mode not in ("balanced", "max_size"):
-        raise ValueError("Mode must be either 'balanced' or 'max_size'")
+    if mode not in ("balanced", "max_size", "fixed"):
+        raise ValueError("Mode must be one of 'balanced', 'max_size', or 'fixed'")
+    target_shape = _validate_fixed_target(mode, target_height, target_width, patch_size)
 
     to_tensor = TF.ToTensor()
     tensors: list[torch.Tensor] = []
     shapes: set[tuple[int, int]] = set()
     for frame in images:
         pil = Image.fromarray(_as_uint8_rgb(frame))
-        pil = _crop_to_supported_aspect_ratio(pil)
+        if target_shape is not None:
+            pil = _crop_to_aspect_ratio(pil, target_shape[0] / target_shape[1])
+        else:
+            pil = _crop_to_supported_aspect_ratio(pil)
         width, height = pil.size
         aspect_ratio = height / max(width, 1)
-        target_shape = (
-            _balanced_target_shape(aspect_ratio, image_resolution, patch_size)
-            if mode == "balanced"
-            else _max_size_target_shape(aspect_ratio, image_resolution, patch_size)
-        )
-        target_h, target_w = target_shape
+        if target_shape is not None:
+            target_h, target_w = target_shape
+        elif mode == "balanced":
+            target_h, target_w = _balanced_target_shape(aspect_ratio, image_resolution, patch_size)
+        else:
+            target_h, target_w = _max_size_target_shape(aspect_ratio, image_resolution, patch_size)
         pil = pil.resize((target_w, target_h), Image.Resampling.BICUBIC)
         tensor = to_tensor(pil)
         shapes.add((tensor.shape[1], tensor.shape[2]))
@@ -155,6 +177,8 @@ def _preprocess_via_disk(
     mode: PreprocessMode,
     patch_size: int,
     tmp_dir: Path,
+    target_height: int | None,
+    target_width: int | None,
 ) -> torch.Tensor:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
@@ -162,7 +186,14 @@ def _preprocess_via_disk(
         out = tmp_dir / f"frame_{idx:06d}.png"
         Image.fromarray(_as_uint8_rgb(frame)).save(out)
         paths.append(str(out))
-    return load_and_preprocess_images(paths, mode=mode, image_resolution=image_resolution, patch_size=patch_size)
+    return load_and_preprocess_images(
+        paths,
+        mode=mode,
+        image_resolution=image_resolution,
+        patch_size=patch_size,
+        target_height=target_height,
+        target_width=target_width,
+    )
 
 
 def _as_uint8_rgb(frame: np.ndarray) -> np.ndarray:

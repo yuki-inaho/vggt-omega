@@ -1,0 +1,4 @@
+name: tensorboard
+enabled: true
+directory: tensorboard
+flush_every_steps: 10

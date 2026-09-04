@@ -31,34 +31,49 @@ def load_checkpoint_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
     return {key.removeprefix("module."): value for key, value in checkpoint.items()}
 
 
-def load_and_preprocess_images(image_path_list, mode="balanced", image_resolution=512, patch_size=16):
+def load_and_preprocess_images(
+    image_path_list,
+    mode="balanced",
+    image_resolution=512,
+    patch_size=16,
+    target_height=None,
+    target_width=None,
+):
     """Load images for VGGT-Omega inference.
 
     `balanced` keeps the total token count close to image_resolution**2.
     `max_size` resizes the longest side to image_resolution.
+    `fixed` center-crops to target_height/target_width and resizes exactly.
     Both modes first center-crop extreme aspect ratios into [0.5, 2.0].
     """
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
-    if mode not in ["balanced", "max_size"]:
-        raise ValueError("Mode must be either 'balanced' or 'max_size'")
+    if mode not in ["balanced", "max_size", "fixed"]:
+        raise ValueError("Mode must be one of 'balanced', 'max_size', or 'fixed'")
     if image_resolution <= 0:
         raise ValueError("image_resolution must be positive")
     if patch_size <= 0:
         raise ValueError("patch_size must be positive")
     if image_resolution % patch_size != 0:
         raise ValueError("image_resolution must be divisible by patch_size")
+    target_shape = _validate_fixed_target(mode, target_height, target_width, patch_size)
 
     images = []
     shapes = set()
     to_tensor = TF.ToTensor()
 
     for image_path in image_path_list:
-        image = _crop_to_supported_aspect_ratio(_load_rgb_image(image_path))
+        image = _load_rgb_image(image_path)
+        if target_shape is not None:
+            image = _crop_to_aspect_ratio(image, target_shape[0] / target_shape[1])
+        else:
+            image = _crop_to_supported_aspect_ratio(image)
         width, height = image.size
         aspect_ratio = height / max(width, 1)
 
-        if mode == "balanced":
+        if target_shape is not None:
+            target_h, target_w = target_shape
+        elif mode == "balanced":
             target_h, target_w = _balanced_target_shape(aspect_ratio, image_resolution, patch_size)
         else:
             target_h, target_w = _max_size_target_shape(aspect_ratio, image_resolution, patch_size)
@@ -96,6 +111,39 @@ def _crop_to_supported_aspect_ratio(image, min_aspect_ratio=0.5, max_aspect_rati
         top = max((height - crop_height) // 2, 0)
         return image.crop((0, top, width, top + crop_height))
     return image
+
+
+def _crop_to_aspect_ratio(image, target_aspect_ratio):
+    """Center-crop a PIL image to an exact height/width aspect ratio."""
+    if not np.isfinite(target_aspect_ratio) or target_aspect_ratio <= 0:
+        raise ValueError("target aspect ratio must be positive and finite")
+    width, height = image.size
+    aspect_ratio = height / max(width, 1)
+    if aspect_ratio < target_aspect_ratio:
+        crop_width = min(width, max(1, int(round(height / target_aspect_ratio))))
+        left = max((width - crop_width) // 2, 0)
+        return image.crop((left, 0, left + crop_width, height))
+    if aspect_ratio > target_aspect_ratio:
+        crop_height = min(height, max(1, int(round(width * target_aspect_ratio))))
+        top = max((height - crop_height) // 2, 0)
+        return image.crop((0, top, width, top + crop_height))
+    return image
+
+
+def _validate_fixed_target(mode, target_height, target_width, patch_size):
+    if mode != "fixed":
+        if target_height is not None or target_width is not None:
+            raise ValueError("target_height and target_width are only valid in fixed mode")
+        return None
+    if isinstance(target_height, bool) or isinstance(target_width, bool):
+        raise ValueError("fixed mode target dimensions must be integers")
+    if not isinstance(target_height, int) or not isinstance(target_width, int):
+        raise ValueError("fixed mode requires integer target_height and target_width")
+    if target_height <= 0 or target_width <= 0:
+        raise ValueError("fixed mode target dimensions must be positive")
+    if target_height % patch_size or target_width % patch_size:
+        raise ValueError("fixed mode target dimensions must be divisible by patch_size")
+    return target_height, target_width
 
 
 def _balanced_target_shape(aspect_ratio, image_resolution, patch_size):

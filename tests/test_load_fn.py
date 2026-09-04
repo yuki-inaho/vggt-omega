@@ -29,6 +29,20 @@ def test_max_size_mode_caps_longest_side(synthetic_image_dir: Path) -> None:
     assert longest == 256
 
 
+def test_fixed_mode_center_crops_and_returns_exact_shape(synthetic_image_dir: Path) -> None:
+    paths = sorted(str(p) for p in synthetic_image_dir.glob("*.png"))
+    images = load_and_preprocess_images(
+        paths,
+        mode="fixed",
+        image_resolution=512,
+        patch_size=16,
+        target_height=384,
+        target_width=512,
+    )
+
+    assert images.shape == (len(paths), 3, 384, 512)
+
+
 def test_load_returns_float_tensor_in_unit_range(synthetic_image_dir: Path) -> None:
     paths = sorted(str(p) for p in synthetic_image_dir.glob("*.png"))
     images = load_and_preprocess_images(paths, image_resolution=128, patch_size=16)
@@ -45,6 +59,9 @@ def test_load_returns_float_tensor_in_unit_range(synthetic_image_dir: Path) -> N
         {"image_resolution": 100, "patch_size": 16},  # not divisible
         {"mode": "weird"},
         {"patch_size": 0},
+        {"mode": "fixed"},
+        {"mode": "fixed", "target_height": 385, "target_width": 512},
+        {"mode": "balanced", "target_height": 384, "target_width": 512},
     ],
 )
 def test_invalid_arguments_raise(synthetic_image_dir: Path, kwargs: dict) -> None:

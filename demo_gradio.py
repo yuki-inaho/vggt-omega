@@ -9,6 +9,7 @@ import gc
 import glob
 import os
 import shutil
+from collections.abc import Sequence
 from datetime import datetime
 
 import cv2
@@ -17,7 +18,7 @@ import numpy as np
 import torch
 
 from vggt_omega.pipeline import VGGTOmegaPipeline
-from vggt_omega.preprocess import load_images_from_paths
+from vggt_omega.preprocess import PreprocessMode, load_images_from_paths
 from visual_util import predictions_to_glb
 
 DEMO_CSS = """
@@ -43,21 +44,79 @@ def make_theme():
     return theme
 
 
-def load_pipeline(checkpoint_path: str, enable_alignment: bool = False) -> VGGTOmegaPipeline:
+def load_pipeline(
+    checkpoint_path: str,
+    head_checkpoint_path: str | None = None,
+    enable_alignment: bool = False,
+) -> VGGTOmegaPipeline:
     if not torch.cuda.is_available():
         raise gr.Error("CUDA is required to run VGGT-Omega.")
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    return VGGTOmegaPipeline(checkpoint_path=checkpoint_path, enable_alignment=enable_alignment)
+    if head_checkpoint_path is not None and not os.path.isfile(head_checkpoint_path):
+        raise FileNotFoundError(f"Head checkpoint not found: {head_checkpoint_path}")
+    return VGGTOmegaPipeline(
+        checkpoint_path=checkpoint_path,
+        head_checkpoint_path=head_checkpoint_path,
+        enable_alignment=enable_alignment,
+    )
 
 
-def run_model(target_dir: str, pipeline: VGGTOmegaPipeline, image_resolution: int) -> dict:
+def resolve_preprocess_options(
+    mode: str,
+    target_height: int | float | None,
+    target_width: int | float | None,
+    recommended_shape: tuple[int, int] | None,
+) -> tuple[PreprocessMode, int | None, int | None]:
+    """Resolve UI/CLI preprocessing choices, preferring a fine-tuned head's training shape."""
+    if mode == "auto":
+        if recommended_shape is None:
+            return "balanced", None, None
+        return "fixed", recommended_shape[0], recommended_shape[1]
+    if mode == "balanced":
+        return "balanced", None, None
+    if mode == "max_size":
+        return "max_size", None, None
+    if mode != "fixed":
+        raise ValueError(f"Unknown preprocessing mode: {mode}")
+
+    height = int(target_height) if target_height is not None else None
+    width = int(target_width) if target_width is not None else None
+    if height is None or width is None:
+        if recommended_shape is None:
+            raise ValueError("Fixed preprocessing requires target height and width")
+        height, width = recommended_shape
+    if height <= 0 or width <= 0 or height % 16 or width % 16:
+        raise ValueError("Target height and width must be positive multiples of 16")
+    return "fixed", height, width
+
+
+def run_model(
+    target_dir: str,
+    pipeline: VGGTOmegaPipeline,
+    image_resolution: int,
+    preprocess_mode: str,
+    target_height: int | float | None,
+    target_width: int | float | None,
+) -> dict:
     print(f"Processing images from {target_dir}")
     image_names = sorted(glob.glob(os.path.join(target_dir, "images", "*")))
     if len(image_names) == 0:
         raise gr.Error("No images found. Please upload images or a video first.")
 
-    images = load_images_from_paths(image_names, image_resolution=image_resolution)
+    mode, height, width = resolve_preprocess_options(
+        preprocess_mode,
+        target_height,
+        target_width,
+        pipeline.recommended_input_shape,
+    )
+    images = load_images_from_paths(
+        image_names,
+        image_resolution=image_resolution,
+        mode=mode,
+        target_height=height,
+        target_width=width,
+    )
     print(f"Preprocessed images shape: {tuple(images.shape)}")
 
     scene = pipeline.run(images).with_world_points()
@@ -131,6 +190,9 @@ def gradio_demo(
     target_dir,
     pipeline,
     image_resolution,
+    preprocess_mode,
+    target_height,
+    target_width,
     conf_thres=20.0,
     mask_black_bg=False,
     mask_white_bg=False,
@@ -149,7 +211,14 @@ def gradio_demo(
     target_dir_images = os.path.join(target_dir, "images")
     all_files = sorted(os.listdir(target_dir_images))
 
-    predictions = run_model(target_dir, pipeline, image_resolution)
+    predictions = run_model(
+        target_dir,
+        pipeline,
+        image_resolution,
+        preprocess_mode,
+        target_height,
+        target_width,
+    )
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
     np.savez(prediction_save_path, **predictions)
 
@@ -267,9 +336,18 @@ lake_speedboat_video = "examples/lake_speedboat.mp4"
 desert_road_video = "examples/desert_road.mp4"
 
 
-def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
+def build_ui(
+    pipeline: VGGTOmegaPipeline,
+    image_resolution: int,
+    preprocess_mode: str,
+    target_height: int | None,
+    target_width: int | None,
+):
     def reconstruct(
         target_dir,
+        selected_preprocess_mode,
+        selected_target_height,
+        selected_target_width,
         conf_thres,
         mask_black_bg,
         mask_white_bg,
@@ -281,6 +359,9 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
             target_dir,
             pipeline,
             image_resolution,
+            selected_preprocess_mode,
+            selected_target_height,
+            selected_target_width,
             conf_thres,
             mask_black_bg,
             mask_white_bg,
@@ -331,6 +412,23 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
                     interactive=True,
                 )
                 input_images = gr.File(file_count="multiple", label="Upload Images", interactive=True)
+                preprocess_mode_control = gr.Dropdown(
+                    choices=["auto", "balanced", "max_size", "fixed"],
+                    value=preprocess_mode,
+                    label="Preprocessing",
+                    info="Auto uses the fine-tuned head's training shape when available.",
+                )
+                with gr.Row():
+                    target_height_control = gr.Number(
+                        value=target_height,
+                        precision=0,
+                        label="Fixed Height",
+                    )
+                    target_width_control = gr.Number(
+                        value=target_width,
+                        precision=0,
+                        label="Fixed Width",
+                    )
                 image_gallery = gr.Gallery(
                     label="Preview",
                     columns=4,
@@ -387,16 +485,71 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
 
         # ---------------------- Examples section ----------------------
         examples = [
-            [snow_lift_video, 1.0, [], 20.0, False, False, True, False, 1000],
-            [forest_road_video, 1.0, [], 30.0, False, False, True, False, 1000],
-            [lake_speedboat_video, 1.0, [], 50.0, False, False, True, False, 1000],
-            [desert_road_video, 1.0, [], 50.0, False, False, True, True, 1000],
+            [
+                snow_lift_video,
+                1.0,
+                [],
+                preprocess_mode,
+                target_height,
+                target_width,
+                20.0,
+                False,
+                False,
+                True,
+                False,
+                1000,
+            ],
+            [
+                forest_road_video,
+                1.0,
+                [],
+                preprocess_mode,
+                target_height,
+                target_width,
+                30.0,
+                False,
+                False,
+                True,
+                False,
+                1000,
+            ],
+            [
+                lake_speedboat_video,
+                1.0,
+                [],
+                preprocess_mode,
+                target_height,
+                target_width,
+                50.0,
+                False,
+                False,
+                True,
+                False,
+                1000,
+            ],
+            [
+                desert_road_video,
+                1.0,
+                [],
+                preprocess_mode,
+                target_height,
+                target_width,
+                50.0,
+                False,
+                False,
+                True,
+                True,
+                1000,
+            ],
         ]
 
         def example_pipeline(
             input_video,
             video_sample_fps,
             input_images,
+            selected_preprocess_mode,
+            selected_target_height,
+            selected_target_width,
             conf_thres,
             mask_black_bg,
             mask_white_bg,
@@ -407,6 +560,9 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
             target_dir, image_paths = handle_uploads(input_video, input_images, video_sample_fps)
             glbfile, log_msg = reconstruct(
                 target_dir,
+                selected_preprocess_mode,
+                selected_target_height,
+                selected_target_width,
                 conf_thres,
                 mask_black_bg,
                 mask_white_bg,
@@ -424,6 +580,9 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
                 input_video,
                 video_sample_fps,
                 input_images,
+                preprocess_mode_control,
+                target_height_control,
+                target_width_control,
                 conf_thres,
                 mask_black_bg,
                 mask_white_bg,
@@ -466,6 +625,9 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
             fn=reconstruct,
             inputs=[
                 target_dir_output,
+                preprocess_mode_control,
+                target_height_control,
+                target_width_control,
                 conf_thres,
                 mask_black_bg,
                 mask_white_bg,
@@ -493,22 +655,56 @@ def build_ui(pipeline: VGGTOmegaPipeline, image_resolution: int):
     return demo
 
 
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser(description="VGGT-Omega Gradio demo")
-    parser.add_argument("--checkpoint", required=True, help="Local VGGT-Omega checkpoint path.")
+    parser.add_argument("--checkpoint", required=True, help="Local full/base VGGT-Omega checkpoint path.")
+    parser.add_argument(
+        "--head-checkpoint",
+        help="Optional head-only best/resume checkpoint to overlay strictly on the base checkpoint.",
+    )
     parser.add_argument("--image-resolution", type=int, default=512, help="Input image resolution. Default: 512.")
+    parser.add_argument(
+        "--preprocess-mode",
+        choices=("auto", "balanced", "max_size", "fixed"),
+        default="auto",
+        help="Auto uses a fine-tuned head's recorded training shape; otherwise it uses balanced mode.",
+    )
+    parser.add_argument("--target-height", type=int, help="Exact height for fixed preprocessing (multiple of 16).")
+    parser.add_argument("--target-width", type=int, help="Exact width for fixed preprocessing (multiple of 16).")
     parser.add_argument("--enable-alignment", action="store_true", help="Enable the text-alignment head.")
     parser.add_argument("--server-name", default="0.0.0.0")
     parser.add_argument("--server-port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
     args = parse_args()
     print(f"Loading checkpoint from {args.checkpoint}")
-    pipeline = load_pipeline(args.checkpoint, enable_alignment=args.enable_alignment)
-    demo = build_ui(pipeline, args.image_resolution)
+    pipeline = load_pipeline(
+        args.checkpoint,
+        head_checkpoint_path=args.head_checkpoint,
+        enable_alignment=args.enable_alignment,
+    )
+    target_height = args.target_height
+    target_width = args.target_width
+    if pipeline.recommended_input_shape is not None:
+        target_height = target_height or pipeline.recommended_input_shape[0]
+        target_width = target_width or pipeline.recommended_input_shape[1]
+    resolved = resolve_preprocess_options(
+        args.preprocess_mode,
+        target_height,
+        target_width,
+        pipeline.recommended_input_shape,
+    )
+    print(f"Default preprocessing: mode={resolved[0]}, height={resolved[1]}, width={resolved[2]}")
+    demo = build_ui(
+        pipeline,
+        args.image_resolution,
+        args.preprocess_mode,
+        target_height,
+        target_width,
+    )
     demo.queue(max_size=20).launch(
         server_name=args.server_name,
         server_port=args.server_port,

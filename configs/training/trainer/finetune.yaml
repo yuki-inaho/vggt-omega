@@ -1,0 +1,19 @@
+name: finetune
+strategy: single
+device: cuda
+epochs: 50
+max_train_steps: null
+max_val_batches: null
+gradient_accumulation_steps: 1
+gradient_clip_norm: 1.0
+validate_every_epochs: 1
+log_every_steps: 10
+deterministic: true
+resume_from: null
+sequence_frames: null
+early_stopping:
+  enabled: false
+  monitor: val/objective
+  mode: min
+  patience: 2
+  min_delta: 0.0

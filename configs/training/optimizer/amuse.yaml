@@ -1,0 +1,14 @@
+name: amuse
+scheduler: none
+muon_lr: 1.0e-4
+aux_lr: 1.0e-5
+aux_update_type: adamw
+beta1: 0.4
+beta2: 0.999
+momentum: 0.95
+rho: 0.3
+r: 0.0
+weight_lr_power: 2.0
+warmup_ratio: 0.05
+weight_decay: 0.01
+weight_decay_at_y: 0.0

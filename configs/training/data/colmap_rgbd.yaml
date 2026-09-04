@@ -1,0 +1,11 @@
+name: colmap_rgbd
+root: ../vggt_training_data/colmap_rgbd_v1
+train_split: train
+val_split: val
+smoke_split: smoke
+min_frames: 2
+max_frames: 4
+batch_size: 1
+num_workers: 2
+pin_memory: true
+min_valid_depth_pixels: 1024

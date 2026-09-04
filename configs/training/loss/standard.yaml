@@ -1,0 +1,14 @@
+name: standard
+training:
+  camera_weight: 5.0
+  depth_weight: 1.0
+  translation_weight: 1.0
+  rotation_weight: 1.0
+  fov_weight: 0.5
+curriculum: []
+validation:
+  camera_weight: 5.0
+  depth_weight: 1.0
+  translation_weight: 1.0
+  rotation_weight: 1.0
+  fov_weight: 0.5

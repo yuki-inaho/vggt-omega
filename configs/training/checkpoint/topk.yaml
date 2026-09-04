@@ -1,0 +1,6 @@
+name: topk
+k: 3
+monitor: val/objective
+mode: min
+save_last: true
+directory: checkpoints

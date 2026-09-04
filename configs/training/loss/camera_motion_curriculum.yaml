@@ -1,0 +1,33 @@
+name: camera_motion_curriculum
+training:
+  camera_weight: 5.0
+  depth_weight: 1.0
+  translation_weight: 1.0
+  rotation_weight: 1.0
+  fov_weight: 0.5
+curriculum:
+  - start_epoch: 0
+    camera_weight: 5.0
+    depth_weight: 0.25
+    translation_weight: 4.0
+    rotation_weight: 2.0
+    fov_weight: 0.1
+  - start_epoch: 3
+    camera_weight: 5.0
+    depth_weight: 0.5
+    translation_weight: 3.0
+    rotation_weight: 2.0
+    fov_weight: 0.25
+  - start_epoch: 6
+    camera_weight: 5.0
+    depth_weight: 1.0
+    translation_weight: 2.0
+    rotation_weight: 1.5
+    fov_weight: 0.5
+validation:
+  # Keep checkpoint ranking comparable across every curriculum stage.
+  camera_weight: 5.0
+  depth_weight: 1.0
+  translation_weight: 1.0
+  rotation_weight: 1.0
+  fov_weight: 0.5

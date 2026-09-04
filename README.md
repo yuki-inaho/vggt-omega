@@ -102,6 +102,49 @@ The demo accepts uploaded images or a video, runs camera and depth inference,
 and visualizes the depth-unprojected point cloud and predicted cameras as a GLB
 scene.
 
+To run a compact head-only checkpoint produced by the supervised fine-tuning
+pipeline, pass both the exact released base and the saved best/resume head:
+
+```bash
+python demo_gradio.py \
+  --checkpoint checkpoints/vggt_omega_1b_512.pt \
+  --head-checkpoint outputs/training/<run>/checkpoints/<best>.pt
+```
+
+The default preprocessing mode is `auto`: a fine-tuned head uses the exact
+height and width recorded in its training configuration (384x512 for the
+provided RGB-D configuration), while a base-only model retains the original
+`balanced` preprocessing. The Gradio controls and CLI also allow `balanced`,
+`max_size`, or an explicit patch-aligned `fixed` shape, for example
+`--preprocess-mode fixed --target-height 384 --target-width 512`. A `.zst`
+checkpoint must be decompressed before loading.
+
+### Camera-motion curriculum fine-tuning
+
+To initialize the trainable camera/depth heads from a completed `last.pt`
+without reusing its optimizer state, select the camera-motion curriculum and
+set `model.initial_head_checkpoint`. Validation retains the standard fixed
+objective, so top-K metrics remain comparable across curriculum stages.
+
+```bash
+PREVIOUS_RUN=outputs/training/2026-09-04/00-21-40
+
+uv run --extra training python scripts/train_colmap_rgbd.py \
+  loss=camera_motion_curriculum \
+  trainer=finetune \
+  trainer.epochs=9 \
+  optimizer.muon_lr=2.5e-5 \
+  optimizer.aux_lr=2.5e-6 \
+  model.initial_head_checkpoint="$PREVIOUS_RUN/checkpoints/last.pt"
+```
+
+The three stages begin at epochs 0, 3, and 6. They progressively reduce the
+extra translation/rotation emphasis while restoring the standard depth weight.
+Use `trainer.resume_from` only to continue an interrupted run with the same
+configuration. Keep the same `model.initial_head_checkpoint` value when
+resuming so the persisted configuration and initialization provenance remain
+identical; the resume state then replaces those initially loaded head weights.
+
 ## Runtime and GPU Memory
 
 We benchmark the end-to-end peak GPU memory usage of `VGGT-Omega-1B-512` on a
@@ -127,7 +170,7 @@ ratio, this gives about 512x336 inputs and uses less GPU memory.
 For standardized robot RGB-D sessions, the native PyTorch BF16 workflow uses
 RGB depth to estimate one robust metric scale per VGGT chunk, then chains
 overlapping chunks into an initial global alignment and fuses masked point
-clouds. See [the RGB-D pose workflow](./docs/RGBD_POSE_WORKFLOW.md).
+clouds.
 
 ## COLMAP-compatible export
 

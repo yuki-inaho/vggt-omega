@@ -34,6 +34,41 @@ def test_preprocess_images_max_size_caps_longest_side(rng: np.random.Generator) 
     assert max(out.shape[2], out.shape[3]) == 128
 
 
+def test_preprocess_images_fixed_shape_matches_fine_tuning_grid(rng: np.random.Generator) -> None:
+    frames = [_make_frame(rng, h=72, w=128), _make_frame(rng, h=80, w=96)]
+    out = preprocess_images(
+        frames,
+        image_resolution=512,
+        mode="fixed",
+        target_height=384,
+        target_width=512,
+    )
+
+    assert out.shape == (2, 3, 384, 512)
+
+
+def test_preprocess_images_fixed_disk_path_matches_in_memory(rng: np.random.Generator, tmp_path: Path) -> None:
+    frames = [_make_frame(rng, h=64, w=112) for _ in range(2)]
+    in_mem = preprocess_images(
+        frames,
+        image_resolution=128,
+        mode="fixed",
+        target_height=64,
+        target_width=96,
+    )
+    via_disk = preprocess_images(
+        frames,
+        image_resolution=128,
+        mode="fixed",
+        target_height=64,
+        target_width=96,
+        tmp_dir=tmp_path / "frames",
+    )
+
+    assert in_mem.shape == (2, 3, 64, 96)
+    assert torch.allclose(in_mem, via_disk, atol=1e-3)
+
+
 def test_preprocess_images_empty_raises() -> None:
     with pytest.raises(ValueError):
         preprocess_images([], image_resolution=128)

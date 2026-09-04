@@ -1,0 +1,21 @@
+defaults:
+  - data: colmap_rgbd
+  - model: omega_1b_512
+  - optimizer: amuse
+  - loss: standard
+  - trainer: smoke
+  - checkpoint: topk
+  - logging: tensorboard
+  - _self_
+
+seed: 42
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false
+  run:
+    dir: outputs/training/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: outputs/training/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

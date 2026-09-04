@@ -7,6 +7,7 @@ set shell := ["bash", "-cu"]
 
 uv := "uv run --extra demo --extra viz"
 uv_rgbd := "uv run --extra rgbd"
+uv_training := "uv run --extra training"
 ckpt_512 := env_var_or_default("VGGT_OMEGA_CKPT", "checkpoints/vggt_omega_1b_512.pt")
 ckpt_256 := env_var_or_default("VGGT_OMEGA_CKPT_256", "checkpoints/vggt_omega_1b_256_text.pt")
 
@@ -16,6 +17,31 @@ default:
 # Install / refresh the dev environment from pyproject.toml.
 sync:
     uv sync --extra demo --extra viz
+
+# Install the supervised-training dependencies without importing AMUSE's
+# upstream environment pins.
+sync-training:
+    uv sync --extra demo --extra viz --extra rgbd --extra training
+
+# Run the focused CPU training-pipeline tests.
+test-training *ARGS:
+    {{uv_training}} pytest tests/test_training_*.py -m "not gpu" {{ARGS}}
+
+# Export one private RGB-D source into the anonymous staging contract.
+prepare-training *ARGS:
+    {{uv_training}} python scripts/prepare_colmap_rgbd_training.py {{ARGS}}
+
+# Strict-load the pretrained model and execute the bounded real-data smoke run.
+train-smoke *ARGS:
+    {{uv_training}} python scripts/train_colmap_rgbd.py trainer=smoke optimizer=amuse {{ARGS}}
+
+# Run the configured 50-epoch domain fine-tune after the smoke gate passes.
+train *ARGS:
+    {{uv_training}} python scripts/train_colmap_rgbd.py trainer=finetune optimizer=amuse {{ARGS}}
+
+# Inspect scalar-only training progress.
+tensorboard logdir="outputs/training" host="127.0.0.1" port="6006":
+    {{uv_training}} tensorboard --logdir "{{logdir}}" --host "{{host}}" --port "{{port}}"
 
 # Format Python files in place.
 format:
