@@ -592,11 +592,6 @@ def train_one_epoch(
                 auxiliary = _dynamic_geometry_losses(predictions, batch, dynamic_geometry_options)
                 losses.update(auxiliary)
                 losses["objective"] = losses["objective"] + auxiliary["dynamic_objective"]
-                if _dynamic_readiness_passed(auxiliary, dynamic_geometry_options):
-                    readiness_setter = getattr(model, "set_dynamic_geometry_ready", None)
-                    if not callable(readiness_setter):
-                        raise ValueError("dynamic geometry wrapper is missing its readiness setter")
-                    readiness_setter(True)
             if pixel_depth_options is not None and dynamic_geometry_options is None:
                 flow_objective = predictions.get("flow_objective")
                 if not isinstance(flow_objective, torch.Tensor):
@@ -717,6 +712,7 @@ def validate_one_epoch(
     renderer_options: Mapping[str, object] | None = None,
     depth_thresholds_m: Iterable[float] = _DEFAULT_DEPTH_EVALUATION_THRESHOLDS_M,
     pixel_depth_options: Mapping[str, object] | None = None,
+    dynamic_geometry_options: Mapping[str, object] | None = None,
     flow_generator: torch.Generator | None = None,
     performance_options: Mapping[str, object] | None = None,
 ) -> dict[str, float]:
@@ -744,7 +740,22 @@ def validate_one_epoch(
         ):
             validate_training_batch_contract(batch)
         with _autocast_context(device, precision):
-            if pixel_depth_options is None:
+            if dynamic_geometry_options is not None:
+                dynamic_forward = getattr(model, "forward_dynamic", None)
+                if not callable(dynamic_forward):
+                    raise ValueError("dynamic geometry validation requires its wrapper")
+                frame_ids = batch.get("frame_ids")
+                if not isinstance(frame_ids, torch.Tensor):
+                    raise ValueError("dynamic geometry validation requires frame_ids")
+                frame_mask = batch.get("frame_mask")
+                if frame_mask is None:
+                    frame_mask = torch.ones_like(frame_ids, dtype=torch.bool)
+                predictions = dynamic_forward(
+                    batch["images"],
+                    frame_ids=frame_ids,
+                    frame_mask=frame_mask,
+                )
+            elif pixel_depth_options is None:
                 predictions = model(batch["images"])
             else:
                 if flow_generator is None or not callable(getattr(model, "forward_refine", None)):
@@ -773,8 +784,9 @@ def validate_one_epoch(
                 pixel_metrics["curriculum_stage_index"] = predictions["depth"].new_tensor(
                     float(pixel_depth_options.get("curriculum_stage_index", 0))
                 )
-                if isinstance(pixel_depth_options.get("gpa"), Mapping) or isinstance(
-                    pixel_depth_options.get("correspondence"), Mapping
+                if dynamic_geometry_options is None and (
+                    isinstance(pixel_depth_options.get("gpa"), Mapping)
+                    or isinstance(pixel_depth_options.get("correspondence"), Mapping)
                 ):
                     if flow_generator is None:
                         raise ValueError("self-supervised validation requires an explicit generator")
@@ -787,6 +799,9 @@ def validate_one_epoch(
                         )
                     )
                 losses = pixel_metrics
+            if dynamic_geometry_options is not None:
+                dynamic_metrics = _dynamic_geometry_losses(predictions, batch, dynamic_geometry_options)
+                losses = {**losses, **dynamic_metrics}
         _ensure_finite_loss(losses)
         _accumulate_metrics(totals, losses)
         has_metric_depth = _accumulate_metric_depth_metrics(
@@ -802,6 +817,10 @@ def validate_one_epoch(
         if max_batches is not None and batch_count >= max_batches:
             break
     metrics = _mean_metrics(totals, batch_count)
+    if dynamic_geometry_options is not None:
+        teacher_coverage = metrics.get("dynamic_teacher_coverage")
+        if teacher_coverage is None or not math.isfinite(teacher_coverage) or teacher_coverage <= 0:
+            raise ValueError("dynamic validation teacher coverage must be finite and positive")
     if metric_depth_available:
         metrics.update(_finalize_metric_depth_metrics(metric_depth_totals, thresholds_m))
     return metrics
@@ -1296,9 +1315,23 @@ def _apply_dynamic_curriculum_stage(
     if len(optimizer.param_groups) != len(base_learning_rates):
         raise ValueError("optimizer parameter-group count changed after dynamic curriculum initialization")
     scale = float(stage["learning_rate_scale"])
+    _set_optimizer_stage_learning_rate_scale(optimizer, base_learning_rates, scale)
+    return bool(stage["train_enabled"])
+
+
+def _set_optimizer_stage_learning_rate_scale(
+    optimizer: torch.optim.Optimizer,
+    base_learning_rates: tuple[float, ...],
+    scale: float,
+) -> None:
+    if not math.isfinite(scale) or scale < 0:
+        raise ValueError("curriculum learning-rate scale must be finite and non-negative")
+    if len(optimizer.param_groups) != len(base_learning_rates):
+        raise ValueError("optimizer parameter-group count changed after curriculum initialization")
     for group, base_learning_rate in zip(optimizer.param_groups, base_learning_rates, strict=True):
         group["lr"] = base_learning_rate * scale
-    return bool(stage["train_enabled"])
+        if "base_lr" in group:
+            group["base_lr"] = base_learning_rate * scale
 
 
 def _dynamic_geometry_losses(
@@ -1570,7 +1603,7 @@ def _dynamic_geometry_losses(
 
 
 def _dynamic_readiness_passed(
-    metrics: Mapping[str, torch.Tensor],
+    metrics: Mapping[str, torch.Tensor | float],
     options: Mapping[str, object],
 ) -> bool:
     readiness = options.get("readiness")
@@ -1587,9 +1620,11 @@ def _dynamic_readiness_passed(
         "dynamic_precision": "min_dynamic_precision",
         "dynamic_recall": "min_dynamic_recall",
     }
-    return all(
-        float(metrics[metric].detach()) >= float(readiness[threshold]) for metric, threshold in requirements.items()
-    )
+
+    def scalar(value: torch.Tensor | float) -> float:
+        return float(value.detach()) if isinstance(value, torch.Tensor) else float(value)
+
+    return all(scalar(metrics[metric]) >= float(readiness[threshold]) for metric, threshold in requirements.items())
 
 
 def _flow_generator(device: torch.device, seed: int) -> torch.Generator:
@@ -1617,8 +1652,7 @@ def _apply_pixel_curriculum_stage(
     if len(optimizer.param_groups) != len(base_learning_rates):
         raise ValueError("optimizer parameter-group count changed after curriculum initialization")
     scale = float(stage["learning_rate_scale"])
-    for group, base_learning_rate in zip(optimizer.param_groups, base_learning_rates, strict=True):
-        group["lr"] = base_learning_rate * scale
+    _set_optimizer_stage_learning_rate_scale(optimizer, base_learning_rates, scale)
     return bool(stage["train_enabled"])
 
 
@@ -2216,6 +2250,7 @@ def run_training(
                         loss_options=_loss_options(cfg.loss.validation),
                         renderer_options=_renderer_options(cfg.renderer),
                         pixel_depth_options=pixel_runtime_options,
+                        dynamic_geometry_options=dynamic_runtime_options,
                         flow_generator=(
                             None
                             if pixel_config is None
@@ -2223,6 +2258,14 @@ def run_training(
                         ),
                         performance_options=performance_config,
                     )
+                    if dynamic_runtime_options is not None and _dynamic_readiness_passed(
+                        latest_val,
+                        dynamic_runtime_options,
+                    ):
+                        readiness_setter = getattr(model, "set_dynamic_geometry_ready", None)
+                        if not callable(readiness_setter):
+                            raise ValueError("dynamic geometry wrapper is missing its readiness setter")
+                        readiness_setter(True)
                     validation_scalars = {f"val/{name}": value for name, value in latest_val.items()}
                     logger.log_scalars(validation_scalars, step=global_step)
                     guardrail_options = (

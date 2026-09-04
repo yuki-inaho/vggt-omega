@@ -24,7 +24,11 @@ from vggt_omega.training.model_factory import (
     attach_pixel_depth_model,
     build_training_model,
 )
-from vggt_omega.training.runner import _renderer_options, validate_one_epoch
+from vggt_omega.training.runner import (
+    _dynamic_geometry_runtime_options,
+    _renderer_options,
+    validate_one_epoch,
+)
 
 ModelFactory = Callable[..., PreparedTrainingModel]
 Validator = Callable[..., Mapping[str, float]]
@@ -45,6 +49,7 @@ _MONITOR_TO_METRIC = {
     "val/rpa_15": "rpa_15",
     "val/rpa_30": "rpa_30",
     "val/near_edge_objective": "near_edge_objective",
+    "val/dynamic_classification": "dynamic_classification",
 }
 _LOSS_WEIGHT_KEYS = (
     "camera_weight",
@@ -838,6 +843,15 @@ def evaluate_training_checkpoints(
                         "max_depth_m": float(cast(Mapping[str, object], pixel_config["geometry"])["max_depth_m"]),
                     }
                     if pixel_enabled and isinstance(pixel_config, Mapping)
+                    else None
+                ),
+                dynamic_geometry_options=(
+                    _dynamic_geometry_runtime_options(
+                        cast(Mapping[str, Any], resolved_config["dynamic_geometry"]),
+                        epoch=int(entry["epoch"]),
+                    )
+                    if isinstance(resolved_config.get("dynamic_geometry"), Mapping)
+                    and cast(Mapping[str, Any], resolved_config["dynamic_geometry"]).get("enabled") is True
                     else None
                 ),
                 flow_generator=(

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from vggt_omega.training.config import validate_training_config
 
@@ -332,6 +332,58 @@ def test_dynamic_geometry_v1_curriculum_composes_and_validates() -> None:
         "visibility_dynamic",
         "joint_low_lr",
     ]
+
+
+def test_dynamic_classification_extended_profile_uses_classification_topk() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_fixed4_b8",
+        "pixel_depth=pixel_perfect_gpa_correspondence",
+        "dynamic_geometry=classification_extended",
+        "checkpoint=topk_dynamic_classification",
+        "trainer=finetune",
+        "trainer.epochs=13",
+        "trainer.max_train_steps=48",
+    )
+
+    validate_training_config(cfg)
+
+    assert [stage.start_epoch for stage in cfg.dynamic_geometry.curriculum] == [0, 1, 2, 12]
+    assert cfg.checkpoint.monitor == "val/dynamic_classification"
+    assert cfg.checkpoint.mode == "min"
+
+
+def test_dynamic_classification_lr_100x_changes_only_classification_stage_scale() -> None:
+    baseline = _compose(
+        "data=colmap_rgbd_fixed4_b8",
+        "pixel_depth=pixel_perfect_gpa_correspondence",
+        "dynamic_geometry=classification_extended",
+        "trainer=finetune",
+        "trainer.epochs=13",
+        "trainer.max_train_steps=48",
+    )
+    experiment = _compose(
+        "data=colmap_rgbd_fixed4_b8",
+        "pixel_depth=pixel_perfect_gpa_correspondence",
+        "dynamic_geometry=classification_lr_100x",
+        "trainer=finetune",
+        "trainer.epochs=13",
+        "trainer.max_train_steps=48",
+    )
+
+    validate_training_config(experiment)
+    baseline_dynamic = OmegaConf.to_container(baseline.dynamic_geometry, resolve=True)
+    experiment_dynamic = OmegaConf.to_container(experiment.dynamic_geometry, resolve=True)
+    assert isinstance(baseline_dynamic, dict) and isinstance(experiment_dynamic, dict)
+    baseline_stages = baseline_dynamic.pop("curriculum")
+    experiment_stages = experiment_dynamic.pop("curriculum")
+    assert experiment_dynamic == baseline_dynamic
+    assert isinstance(baseline_stages, list) and isinstance(experiment_stages, list)
+    for index, (baseline_stage, experiment_stage) in enumerate(zip(baseline_stages, experiment_stages, strict=True)):
+        if index == 2:
+            assert {**experiment_stage, "learning_rate_scale": 0.5} == baseline_stage
+            assert experiment_stage["learning_rate_scale"] == 100.0
+        else:
+            assert experiment_stage == baseline_stage
 
 
 def test_dynamic_geometry_requires_pixel_depth_wrapper() -> None:

@@ -38,6 +38,7 @@ _VALIDATION_MONITORS = {
     "val/rpa_15",
     "val/rpa_30",
     "val/near_edge_objective",
+    "val/dynamic_classification",
 }
 
 

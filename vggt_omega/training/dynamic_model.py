@@ -252,6 +252,7 @@ class DynamicGeometryTrainingModel(nn.Module):
         batch_size, frame_count, _, height, width = images.shape
         grouped: dict[int, list[int]] = defaultdict(list)
         positions: dict[int, torch.Tensor] = {}
+        residual_gate: torch.Tensor | None = None
         for sample in range(batch_size):
             valid_positions = torch.nonzero(frame_mask[sample], as_tuple=False).flatten()
             positions[sample] = valid_positions
@@ -274,6 +275,17 @@ class DynamicGeometryTrainingModel(nn.Module):
             context = self.wrapped_model.prepare_dynamic_context(compact_images, initial_noise=noise)
             if context["depth"].shape[:2] != (len(samples), count):
                 raise ValueError("dynamic context returned an invalid depth shape")
+            group_residual_gate = context.get("residual_gate")
+            if (
+                not isinstance(group_residual_gate, torch.Tensor)
+                or group_residual_gate.ndim != 0
+                or not torch.isfinite(group_residual_gate)
+            ):
+                raise ValueError("dynamic context must return a finite scalar residual_gate")
+            if residual_gate is None:
+                residual_gate = group_residual_gate
+            elif not torch.equal(residual_gate.detach(), group_residual_gate.detach()):
+                raise ValueError("dynamic context residual_gate must be identical across compact groups")
             for index, sample in enumerate(samples):
                 collected[sample] = {
                     key: value[index]
@@ -283,6 +295,7 @@ class DynamicGeometryTrainingModel(nn.Module):
                 collected[sample]["patch_grid_hw"] = context["patch_grid_hw"]
 
         first = collected[0]
+        assert residual_gate is not None
         patch_count, feature_dim = first["patch_features"].shape[-2:]
         depth = images.new_zeros((batch_size, frame_count, height, width, 1))
         pose = images.new_zeros((batch_size, frame_count, 9))
@@ -305,6 +318,7 @@ class DynamicGeometryTrainingModel(nn.Module):
             "patch_grid_hw": first["patch_grid_hw"],
             "patch_valid_mask": patch_mask,
             "depth_valid_mask": depth_valid,
+            "residual_gate": residual_gate,
         }
 
     def _head_outputs(

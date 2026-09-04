@@ -1,0 +1,85 @@
+enabled: true
+contract_version: 1
+pair_mode: adjacent_bidirectional
+padding_base_forward: group_by_valid_count
+depth_source: pixel_refined_fixed_noise
+refinement_seed: 7301
+hidden_dim: 128
+relative_camera_dim: 14
+pair_chunk_size: 2
+visibility_threshold: 0.5
+static_probability_max: 0.25
+dynamic_probability_min: 0.75
+joint_base_parameter_prefixes:
+  - wrapped_model.base_model.camera_head.
+  - wrapped_model.base_model.dense_head.
+initialization:
+  flow_zero: true
+  visibility_probability: 0.01
+  dynamic_probability: 0.01
+geometry:
+  max_depth_m: 1.2
+pseudo_labels:
+  teacher_artifact_manifest: flow_teacher/manifest.json
+  temporal_depth_neighborhood: 3
+  static_off_m: 0.01
+  dynamic_on_m: 0.03
+  flow_confidence_min: 0.8
+  forward_backward_cycle_px: 1.0
+  depth_discontinuity_relative: 0.03
+  photo_sigma: 0.10
+  texture_gradient_scale: 0.05
+  flow_coherence_sigma_px: 1.0
+  max_flow_fraction: 0.50
+readiness:
+  min_visibility_positive_count: 32
+  min_visibility_negative_count: 32
+  min_visibility_known_coverage: 0.01
+  min_visibility_precision: 0.80
+  min_dynamic_static_count: 32
+  min_dynamic_positive_count: 32
+  min_dynamic_known_coverage: 0.01
+  min_dynamic_precision: 0.80
+  min_dynamic_recall: 0.50
+loss:
+  scene_flow_weight: 1.0
+  cycle_weight: 0.1
+  reprojection_weight: 0.1
+  temporal_depth_weight: 0.1
+  visibility_weight: 0.2
+  dynamic_weight: 0.2
+  spatial_weight: 0.01
+  temporal_mask_weight: 0.05
+  area_prior_weight: 0.001
+  charbonnier_alpha: 0.5
+  charbonnier_epsilon: 0.001
+  area_lower: 0.01
+  area_upper: 0.50
+teacher_ema:
+  enabled: false
+  decay: 0.999
+guardrail:
+  max_near_depth_mae_m_degradation: 0.01
+  max_camera_translation_degradation: 0.01
+  max_objective_degradation: 0.02
+curriculum:
+  - name: baseline_parity
+    start_epoch: 0
+    train_enabled: false
+    dynamic_stage: disabled
+    learning_rate_scale: 0.0
+  - name: motion_only
+    start_epoch: 1
+    train_enabled: true
+    dynamic_stage: motion_only
+    learning_rate_scale: 1.0
+  - name: visibility_dynamic
+    start_epoch: 2
+    train_enabled: true
+    dynamic_stage: visibility_dynamic
+    learning_rate_scale: 0.5
+  - name: joint_low_lr
+    start_epoch: 12
+    train_enabled: true
+    dynamic_stage: joint
+    learning_rate_scale: 0.1

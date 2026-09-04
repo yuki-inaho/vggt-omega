@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from torch import nn
@@ -11,10 +13,12 @@ from vggt_omega.training.runner import (
     _dynamic_geometry_losses,
     _dynamic_geometry_runtime_options,
     _dynamic_guardrail_options,
+    _dynamic_readiness_passed,
     _guardrail_violations,
     _load_trainable_state,
     _select_trainable_state,
     train_one_epoch,
+    validate_one_epoch,
 )
 
 
@@ -50,6 +54,7 @@ class _TinyDynamicContext(nn.Module):
             "patch_features": torch.ones(batch, frames, grid[0] * grid[1], 8, device=images.device),
             "patch_grid_hw": torch.tensor(grid, device=images.device),
             "patch_valid_mask": torch.ones(batch, frames, grid[0] * grid[1], dtype=torch.bool),
+            "residual_gate": self.scale.sigmoid(),
         }
 
     @staticmethod
@@ -127,6 +132,7 @@ def test_enabled_dynamic_wrapper_preserves_legacy_forward_and_is_fail_closed() -
         frame_mask=torch.ones(1, 3, dtype=torch.bool),
     )
     assert dynamic["canonical_scene_flow"].shape == (1, 4, 5, 7, 3)
+    torch.testing.assert_close(dynamic["residual_gate"], prepared.model.scale.sigmoid())
     assert dynamic["dynamic_geometry_ready"].item() is False
     assert not dynamic["dynamic_mask"].any()
     torch.testing.assert_close(dynamic["dynamic_unknown_mask"], dynamic["motion_domain_mask"])
@@ -341,6 +347,40 @@ def test_dynamic_runtime_stage_and_static_rgbd_objective_have_finite_backward() 
     ]
     assert gradients and all(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
     optimizer.zero_grad(set_to_none=True)
+    validation = validate_one_epoch(
+        model=model,
+        batches=[batch],
+        device=torch.device("cpu"),
+        min_valid_depth_pixels=1,
+        dynamic_geometry_options=active,
+    )
+    for metric in (
+        "dynamic_classification",
+        "dynamic_f1",
+        "dynamic_iou",
+        "dynamic_visibility_f1",
+        "dynamic_visibility_iou",
+        "dynamic_teacher_coverage",
+    ):
+        assert metric in validation
+        assert math.isfinite(validation[metric])
+    zero_threshold_options = {
+        **active,
+        "readiness": dict.fromkeys(active["readiness"], 0.0),
+    }
+    assert _dynamic_readiness_passed(validation, zero_threshold_options)
+    assert model.dynamic_geometry_ready.item() is False
+    missing_teacher_batch = {
+        key: value for key, value in batch.items() if key not in {"motion_pixel_flow_xy", "motion_flow_confidence"}
+    }
+    with pytest.raises(ValueError, match="dynamic validation teacher coverage"):
+        validate_one_epoch(
+            model=model,
+            batches=[missing_teacher_batch],
+            device=torch.device("cpu"),
+            min_valid_depth_pixels=1,
+            dynamic_geometry_options=active,
+        )
     result = train_one_epoch(
         model=model,
         batches=[batch],

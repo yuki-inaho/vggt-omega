@@ -17,6 +17,7 @@ from vggt_omega.training.optimizer_factory import (
     classify_amuse_parameters,
     validate_parameter_partition,
 )
+from vggt_omega.training.runner import _set_optimizer_stage_learning_rate_scale
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AMUSE_SOURCE = REPO_ROOT / "vggt_omega" / "training" / "optim" / "amuse.py"
@@ -219,6 +220,24 @@ def test_build_amuse_optimizer_computes_warmup_and_preserves_explicit_mode() -> 
     assert result.optimizer.param_groups[1]["use_muon"] is False
     assert result.optimizer.param_groups[1]["update_type"] == "adamw"
     assert result.grouping.fingerprint == result.group_fingerprint
+
+
+def test_amuse_preserves_explicit_stage_learning_rate_scale_after_step() -> None:
+    matrix, bias, optimizer = _make_small_optimizer()
+    base_learning_rates = tuple(float(group["lr"]) for group in optimizer.param_groups)
+    _set_optimizer_stage_learning_rate_scale(optimizer, base_learning_rates, 0.5)
+    matrix.grad = torch.ones_like(matrix)
+    bias.grad = torch.ones_like(bias)
+
+    optimizer.train()
+    optimizer.step()
+
+    # The first of two warmup steps applies sched=0.5 in addition to the
+    # curriculum's persistent stage scale=0.5.
+    assert optimizer.param_groups[0]["base_lr"] == pytest.approx(1e-3 * 0.5)
+    assert optimizer.param_groups[1]["base_lr"] == pytest.approx(1e-4 * 0.5)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-3 * 0.5 * 0.5)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(1e-4 * 0.5 * 0.5)
 
 
 def test_build_amuse_optimizer_rejects_external_scheduler() -> None:

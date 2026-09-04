@@ -1,0 +1,6 @@
+name: topk_dynamic_classification
+k: 3
+monitor: val/dynamic_classification
+mode: min
+save_last: true
+directory: checkpoints

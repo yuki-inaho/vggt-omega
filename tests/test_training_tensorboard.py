@@ -202,8 +202,8 @@ def test_logger_rejects_unknown_or_nonfinite_scalars(tmp_path: Path) -> None:
     logger.close()
 
 
-def test_scalar_logger_writes_all_dynamic_training_tags(tmp_path: Path) -> None:
-    dynamic_tags = {
+def test_scalar_logger_writes_all_dynamic_training_and_validation_tags(tmp_path: Path) -> None:
+    dynamic_training_tags = {
         "train/dynamic_area_prior",
         "train/dynamic_classification",
         "train/dynamic_curriculum_stage_index",
@@ -227,6 +227,7 @@ def test_scalar_logger_writes_all_dynamic_training_tags(tmp_path: Path) -> None:
         "train/dynamic_visibility_positive_count",
         "train/dynamic_visibility_precision",
     }
+    dynamic_tags = dynamic_training_tags | {tag.replace("train/", "val/", 1) for tag in dynamic_training_tags}
     logger = TensorBoardScalarLogger(log_dir=tmp_path, enabled=True, rank=0)
     logger.log_scalars(dict.fromkeys(dynamic_tags, 0.25), step=1)
     logger.close()

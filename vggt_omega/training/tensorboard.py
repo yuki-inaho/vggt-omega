@@ -164,7 +164,7 @@ ALLOWED_SCALAR_TAGS = frozenset(
         "system/max_cuda_memory_gib",
     }
     | {f"val/{prefix}_{suffix}" for prefix in _DEPTH_EVALUATION_PREFIXES for suffix in _DEPTH_EVALUATION_SUFFIXES}
-    | {f"train/{suffix}" for suffix in _DYNAMIC_TRAINING_SUFFIXES}
+    | {f"{split}/{suffix}" for split in ("train", "val") for suffix in _DYNAMIC_TRAINING_SUFFIXES}
 )
 
 

@@ -493,6 +493,52 @@ def test_evaluator_recomputes_configured_translation_monitor(tmp_path: Path) -> 
     assert all(item["metric_absolute_error"] == 0.0 for item in report["checkpoints"])
 
 
+def test_evaluator_recomputes_configured_dynamic_classification_monitor(tmp_path: Path) -> None:
+    run_dir, original_cwd, config = _make_run(tmp_path)
+    config["checkpoint"]["monitor"] = "val/dynamic_classification"
+    _write_json(run_dir / "resolved_config.json", config)
+    leaderboard_path = run_dir / "checkpoints" / "leaderboard.json"
+    leaderboard = json.loads(leaderboard_path.read_text())
+    leaderboard["monitor"] = "val/dynamic_classification"
+    _write_json(leaderboard_path, leaderboard)
+    for checkpoint in (run_dir / "checkpoints").glob("best_epoch_*.pt"):
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        payload["config"] = config
+        payload["monitor"] = "val/dynamic_classification"
+        torch.save(payload, checkpoint)
+    last_checkpoint = run_dir / "checkpoints" / "last.pt"
+    last_payload = torch.load(last_checkpoint, map_location="cpu", weights_only=True)
+    last_payload["config"] = config
+    torch.save(last_payload, last_checkpoint)
+    *_, model_factory, dataset_factory, _ = _evaluation_dependencies()
+
+    def validator(*, model: torch.nn.Module, **kwargs: Any) -> dict[str, float]:
+        value = float(model.get_parameter("head").detach())
+        return {
+            "camera": value,
+            "camera_translation": value,
+            "camera_rotation": 0.0,
+            "camera_fov": 0.0,
+            "depth": 0.0,
+            "objective": value * 5.0,
+            "dynamic_classification": value,
+        }
+
+    report = evaluate_training_checkpoints(
+        run_dir,
+        output_path=tmp_path / "report.json",
+        original_cwd=original_cwd,
+        device="cpu",
+        model_factory=model_factory,
+        dataset_factory=dataset_factory,
+        validator=validator,
+    )
+
+    assert report["status"] == "passed"
+    assert report["monitor"] == "val/dynamic_classification"
+    assert all(item["metric_absolute_error"] == 0.0 for item in report["checkpoints"])
+
+
 def test_evaluator_rejects_false_early_stop_claim(tmp_path: Path) -> None:
     run_dir, original_cwd, _ = _make_run(tmp_path)
     summary_path = run_dir / "run_summary.json"
