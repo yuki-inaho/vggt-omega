@@ -43,11 +43,7 @@ ALLOWED_SCALAR_TAGS = frozenset(
         "val/depth",
         "system/max_cuda_memory_gib",
     }
-    | {
-        f"val/{prefix}_{suffix}"
-        for prefix in _DEPTH_EVALUATION_PREFIXES
-        for suffix in _DEPTH_EVALUATION_SUFFIXES
-    }
+    | {f"val/{prefix}_{suffix}" for prefix in _DEPTH_EVALUATION_PREFIXES for suffix in _DEPTH_EVALUATION_SUFFIXES}
 )
 
 
