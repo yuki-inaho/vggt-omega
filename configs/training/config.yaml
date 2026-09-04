@@ -6,6 +6,7 @@ defaults:
   - trainer: smoke
   - checkpoint: topk
   - logging: tensorboard
+  - renderer: soft
   - _self_
 
 seed: 42

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,81 @@ _ENTRY_PATTERN = re.compile(r"(scene_\d{6})/sequence_(\d{6})$")
 
 class DataContractError(ValueError):
     """Raised when an exported scene or sample violates the loader contract."""
+
+
+def overlap_curriculum_target(epoch: int, epochs: int, *, start_target: float, end_target: float) -> float:
+    """Interpolate a high-to-medium overlap target at an epoch boundary."""
+
+    if epoch < 0 or epochs < 1:
+        raise DataContractError("overlap curriculum epoch values are invalid")
+    if not 0 <= end_target <= start_target <= 1:
+        raise DataContractError("overlap curriculum targets must satisfy 0 <= end <= start <= 1")
+    progress = min(epoch, epochs - 1) / max(epochs - 1, 1)
+    return float(start_target + (end_target - start_target) * progress)
+
+
+def select_overlap_frame_offsets(
+    pair_scores: np.ndarray,
+    pair_valid: np.ndarray,
+    *,
+    sample_length: int,
+    target: float,
+    tolerance: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, float, bool]:
+    """Select frame offsets around a target, with explicit nearest fallback."""
+
+    scores = np.asarray(pair_scores)
+    valid = np.asarray(pair_valid)
+    if (
+        scores.ndim != 2
+        or scores.shape[0] != scores.shape[1]
+        or valid.shape != scores.shape
+        or valid.dtype != np.bool_
+        or not np.isfinite(scores).all()
+        or ((scores < 0) | (scores > 1)).any()
+    ):
+        raise DataContractError("overlap selection arrays violate the numeric contract")
+    if not 2 <= sample_length <= scores.shape[0]:
+        raise DataContractError("overlap sample_length is outside the profile shape")
+    if not math.isfinite(target) or not 0 <= target <= 1 or not math.isfinite(tolerance) or tolerance < 0:
+        raise DataContractError("overlap target and tolerance are invalid")
+    candidates = np.argwhere(np.triu(valid, k=1))
+    if not len(candidates):
+        raise DataContractError("overlap profile contains no valid frame pair")
+
+    def choose(values: np.ndarray) -> tuple[int, bool]:
+        distance = np.abs(values - target)
+        in_range = np.flatnonzero(distance <= tolerance)
+        if len(in_range):
+            return int(in_range[int(rng.integers(0, len(in_range)))]), False
+        nearest = np.flatnonzero(np.isclose(distance, distance.min(), rtol=0, atol=1e-7))
+        return int(nearest[int(rng.integers(0, len(nearest)))]), True
+
+    candidate_scores = scores[candidates[:, 0], candidates[:, 1]]
+    seed_index, used_fallback = choose(candidate_scores)
+    selected = [int(value) for value in candidates[seed_index]]
+    while len(selected) < sample_length:
+        remaining = [index for index in range(scores.shape[0]) if index not in selected]
+        aggregate_scores: list[float] = []
+        eligible: list[int] = []
+        for candidate in remaining:
+            active_scores = [float(scores[candidate, current]) for current in selected if valid[candidate, current]]
+            if active_scores:
+                eligible.append(candidate)
+                aggregate_scores.append(float(np.mean(active_scores)))
+        if not eligible:
+            raise DataContractError("overlap profile cannot extend the selected frame pair")
+        selected_index, extension_fallback = choose(np.asarray(aggregate_scores, dtype=np.float32))
+        used_fallback |= extension_fallback
+        selected.append(eligible[selected_index])
+
+    pair_values = [float(scores[first, second]) for first, second in combinations(selected, 2)]
+    actual_score = float(np.mean(pair_values))
+    reference_position = int(rng.integers(0, len(selected)))
+    reference = selected.pop(reference_position)
+    rng.shuffle(selected)
+    return np.asarray([reference, *selected], dtype=np.int64), actual_score, used_fallback
 
 
 class ColmapRgbdDataset(Dataset[dict[str, Any]]):
@@ -37,6 +114,12 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
         max_frames: int = 4,
         seed: int = 0,
         min_valid_depth_pixels: int = 1,
+        overlap_curriculum_enabled: bool = False,
+        overlap_metric: str = "near_depth",
+        overlap_start_target: float = 0.75,
+        overlap_end_target: float = 0.5,
+        overlap_target_tolerance: float = 0.05,
+        overlap_curriculum_epochs: int = 1,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -44,6 +127,12 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
         self.max_frames = int(max_frames)
         self.seed = int(seed)
         self.min_valid_depth_pixels = int(min_valid_depth_pixels)
+        self.overlap_curriculum_enabled = bool(overlap_curriculum_enabled)
+        self.overlap_metric = str(overlap_metric)
+        self.overlap_start_target = float(overlap_start_target)
+        self.overlap_end_target = float(overlap_end_target)
+        self.overlap_target_tolerance = float(overlap_target_tolerance)
+        self.overlap_curriculum_epochs = int(overlap_curriculum_epochs)
         self.epoch = 0
         if split not in {"train", "val", "smoke"}:
             raise DataContractError("split must be one of train, val, or smoke")
@@ -51,6 +140,16 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
             raise DataContractError("frame counts must satisfy 2 <= min_frames <= max_frames")
         if self.min_valid_depth_pixels < 1:
             raise DataContractError("min_valid_depth_pixels must be positive")
+        if self.overlap_metric not in {"all_depth", "near_depth"}:
+            raise DataContractError("overlap_metric must be all_depth or near_depth")
+        overlap_curriculum_target(
+            0,
+            self.overlap_curriculum_epochs,
+            start_target=self.overlap_start_target,
+            end_target=self.overlap_end_target,
+        )
+        if not math.isfinite(self.overlap_target_tolerance) or self.overlap_target_tolerance < 0:
+            raise DataContractError("overlap_target_tolerance must be finite and non-negative")
         try:
             metadata = json.loads((self.root / "dataset.json").read_text())
         except (OSError, ValueError) as error:
@@ -83,6 +182,35 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
         self.max_depth_mm = int(depth_metadata.get("max_depth_mm", 0))
         if self.max_depth_mm <= 0:
             raise DataContractError("max_depth_mm is invalid")
+        overlap_metadata = metadata.get("overlap")
+        expected_overlap_keys = {
+            "schema_version",
+            "filename",
+            "aggregation",
+            "relative_depth_tolerance",
+            "pixel_stride",
+            "near_depth_m",
+        }
+        if (
+            not isinstance(overlap_metadata, dict)
+            or set(overlap_metadata) != expected_overlap_keys
+            or overlap_metadata.get("schema_version") != 1
+            or overlap_metadata.get("filename") != "overlap.npz"
+            or overlap_metadata.get("aggregation") != "bidirectional_mean"
+            or not isinstance(overlap_metadata.get("relative_depth_tolerance"), (int, float))
+            or isinstance(overlap_metadata.get("relative_depth_tolerance"), bool)
+            or not math.isfinite(float(overlap_metadata["relative_depth_tolerance"]))
+            or float(overlap_metadata["relative_depth_tolerance"]) <= 0
+            or not isinstance(overlap_metadata.get("pixel_stride"), int)
+            or isinstance(overlap_metadata.get("pixel_stride"), bool)
+            or int(overlap_metadata["pixel_stride"]) <= 0
+            or not isinstance(overlap_metadata.get("near_depth_m"), (int, float))
+            or isinstance(overlap_metadata.get("near_depth_m"), bool)
+            or not math.isfinite(float(overlap_metadata["near_depth_m"]))
+            or float(overlap_metadata["near_depth_m"]) <= 0
+        ):
+            raise DataContractError("overlap profile metadata is missing or invalid")
+        self.overlap_metadata = dict(overlap_metadata)
         camera_metadata = metadata.get("camera", {})
         if (
             camera_metadata.get("extrinsics") != "opencv_world_to_camera"
@@ -110,6 +238,10 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
                 raise DataContractError("split entry is not a generic relative sequence name")
             entries.append((match.group(1), int(match.group(2))))
         self.entries = entries
+        for scene_name in {scene_name for scene_name, _ in entries}:
+            overlap_path = self.root / "scenes" / scene_name / str(self.overlap_metadata["filename"])
+            if overlap_path.is_symlink() or not overlap_path.is_file():
+                raise DataContractError("overlap profile file is missing or is not a regular file")
         self._scenes: dict[str, dict[str, np.ndarray]] = {}
 
     def set_epoch(self, epoch: int) -> None:
@@ -145,6 +277,13 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
                 if set(sequences.files) != {"sequences", "lengths", "split_ids", "chunk_ids"}:
                     raise DataContractError(f"{scene_name} contains unexpected sequence arrays")
                 scene.update({f"sequence_{key}": sequences[key].copy() for key in sequences.files})
+            overlap_path = scene_root / str(self.overlap_metadata["filename"])
+            if overlap_path.is_symlink():
+                raise DataContractError("overlap profile must not be a symlink")
+            with np.load(overlap_path, allow_pickle=False) as overlap:
+                if set(overlap.files) != {"all_depth", "near_depth", "pair_valid"}:
+                    raise DataContractError(f"{scene_name} contains unexpected overlap arrays")
+                scene.update({f"overlap_{key}": overlap[key].copy() for key in overlap.files})
         except (OSError, ValueError, KeyError, DataContractError) as error:
             raise DataContractError(f"scene arrays are missing or invalid for {scene_name}") from error
         frame_count = len(scene.get("frame_ids", ()))
@@ -219,6 +358,35 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
                 or not scene["quality_flags"][active].all()
             ):
                 raise DataContractError(f"{scene_name} contains an invalid stored sequence")
+        overlap_shape = (sequence_count, self.stored_max_frames, self.stored_max_frames)
+        overlap_all = scene.get("overlap_all_depth")
+        overlap_near = scene.get("overlap_near_depth")
+        overlap_valid = scene.get("overlap_pair_valid")
+        if (
+            overlap_all is None
+            or overlap_near is None
+            or overlap_valid is None
+            or overlap_all.shape != overlap_shape
+            or overlap_near.shape != overlap_shape
+            or overlap_valid.shape != overlap_shape
+            or overlap_all.dtype != np.float32
+            or overlap_near.dtype != np.float32
+            or overlap_valid.dtype != np.bool_
+            or not np.isfinite(overlap_all).all()
+            or not np.isfinite(overlap_near).all()
+            or ((overlap_all < 0) | (overlap_all > 1)).any()
+            or ((overlap_near < 0) | (overlap_near > 1)).any()
+            or not np.allclose(overlap_all, overlap_all.transpose(0, 2, 1), atol=1e-6)
+            or not np.allclose(overlap_near, overlap_near.transpose(0, 2, 1), atol=1e-6)
+        ):
+            raise DataContractError(f"{scene_name} overlap profile violates the numeric contract")
+        expected_valid = np.zeros(overlap_shape, dtype=np.bool_)
+        for sequence_id, length in enumerate(scene["sequence_lengths"]):
+            count = int(length)
+            expected_valid[sequence_id, :count, :count] = True
+            np.fill_diagonal(expected_valid[sequence_id], False)
+        if not np.array_equal(overlap_valid, expected_valid):
+            raise DataContractError(f"{scene_name} overlap pair mask violates the sequence contract")
         self._scenes[scene_name] = scene
         return scene
 
@@ -277,15 +445,38 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
         upper_length = min(self.max_frames, stored_length)
         rng = np.random.default_rng(np.random.SeedSequence((self.seed, self.epoch, int(index))))
         sample_length = int(rng.integers(self.min_frames, upper_length + 1))
-        start = int(rng.integers(0, stored_length - sample_length + 1))
         stored = scene["sequence_sequences"][sequence_id, :stored_length]
-        selected = np.asarray(stored[start : start + sample_length], dtype=np.int64)
+        sampling_metrics: dict[str, torch.Tensor] = {}
+        if self.overlap_curriculum_enabled:
+            target = overlap_curriculum_target(
+                self.epoch,
+                self.overlap_curriculum_epochs,
+                start_target=self.overlap_start_target,
+                end_target=self.overlap_end_target,
+            )
+            offsets, actual_score, used_fallback = select_overlap_frame_offsets(
+                scene[f"overlap_{self.overlap_metric}"][sequence_id, :stored_length, :stored_length],
+                scene["overlap_pair_valid"][sequence_id, :stored_length, :stored_length],
+                sample_length=sample_length,
+                target=target,
+                tolerance=self.overlap_target_tolerance,
+                rng=rng,
+            )
+            selected = np.asarray(stored[offsets], dtype=np.int64)
+            sampling_metrics = {
+                "sampling_overlap_score": torch.tensor(actual_score, dtype=torch.float32),
+                "sampling_overlap_target": torch.tensor(target, dtype=torch.float32),
+                "sampling_overlap_fallback": torch.tensor(float(used_fallback), dtype=torch.float32),
+            }
+        else:
+            start = int(rng.integers(0, stored_length - sample_length + 1))
+            selected = np.asarray(stored[start : start + sample_length], dtype=np.int64)
+            reference_offset = int(rng.integers(0, sample_length))
+            selected = np.concatenate(
+                (selected[reference_offset : reference_offset + 1], np.delete(selected, reference_offset))
+            )
         if (selected < 0).any() or (selected >= len(scene["frame_ids"])).any():
             raise DataContractError("stored sequence contains an invalid frame ID")
-        reference_offset = int(rng.integers(0, sample_length))
-        selected = np.concatenate(
-            (selected[reference_offset : reference_offset + 1], np.delete(selected, reference_offset))
-        )
         if not scene["quality_flags"][selected].all():
             raise DataContractError("stored sequence contains a frame that failed pose quality checks")
         expected_chunk = int(scene["sequence_chunk_ids"][sequence_id])
@@ -312,4 +503,5 @@ class ColmapRgbdDataset(Dataset[dict[str, Any]]):
             "normalization_scale_m": geometry["scale"],
             "scene_id": scene_name,
             "sequence_id": sequence_id,
+            **sampling_metrics,
         }

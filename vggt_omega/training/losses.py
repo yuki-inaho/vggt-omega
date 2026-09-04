@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 import torch
 
-from vggt_omega.utils.pose_enc import extri_intri_to_pose_encoding
+from vggt_omega.utils.pose_enc import encoding_to_camera, extri_intri_to_pose_encoding
 
 
 def build_camera_pose_target(
@@ -105,6 +105,143 @@ def compute_depth_loss(
     return (scalar_prediction[depth_mask] - target_depth[depth_mask]).abs().mean()
 
 
+def _relative_pair_transforms(extrinsics: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    frame_count = int(extrinsics.shape[1])
+    pair_indices = torch.triu_indices(frame_count, frame_count, offset=1, device=extrinsics.device)
+    first_rotation = extrinsics[:, pair_indices[0], :3, :3]
+    second_rotation = extrinsics[:, pair_indices[1], :3, :3]
+    first_translation = extrinsics[:, pair_indices[0], :3, 3]
+    second_translation = extrinsics[:, pair_indices[1], :3, 3]
+    relative_rotation = second_rotation @ first_rotation.transpose(-1, -2)
+    relative_translation = second_translation - torch.einsum("bpij,bpj->bpi", relative_rotation, first_translation)
+    return relative_rotation, relative_translation
+
+
+def _rotation_geodesic_radians(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    error = predicted @ target.transpose(-1, -2)
+    skew = torch.stack(
+        (
+            error[..., 2, 1] - error[..., 1, 2],
+            error[..., 0, 2] - error[..., 2, 0],
+            error[..., 1, 0] - error[..., 0, 1],
+        ),
+        dim=-1,
+    )
+    sine = torch.linalg.vector_norm(skew, dim=-1) / 2
+    cosine = ((torch.diagonal(error, dim1=-2, dim2=-1).sum(dim=-1) - 1) / 2).clamp(-1, 1)
+    return torch.atan2(sine, cosine)
+
+
+def compute_pairwise_pose_loss(
+    predicted_pose: torch.Tensor,
+    target_extrinsics: torch.Tensor,
+    image_size_hw: tuple[int, int],
+    *,
+    rotation_weight: float = 1.0,
+    translation_direction_weight: float = 1.0,
+    translation_magnitude_weight: float = 1.0,
+    baseline_epsilon: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Compare all relative camera transforms in a sequence."""
+
+    if predicted_pose.ndim != 3 or predicted_pose.shape[-1] != 9:
+        raise ValueError("predicted_pose must have shape [B,S,9]")
+    if target_extrinsics.shape != (*predicted_pose.shape[:2], 3, 4):
+        raise ValueError("target_extrinsics must have shape [B,S,3,4]")
+    if not predicted_pose.is_floating_point() or not target_extrinsics.is_floating_point():
+        raise TypeError("pairwise pose inputs must be floating point")
+    _require_finite("predicted_pose", predicted_pose)
+    _require_finite("target_extrinsics", target_extrinsics)
+    for name, value in (
+        ("relative_rotation_weight", rotation_weight),
+        ("relative_translation_direction_weight", translation_direction_weight),
+        ("relative_translation_magnitude_weight", translation_magnitude_weight),
+    ):
+        _validate_nonnegative_finite_weight(name, value)
+    if not math.isfinite(baseline_epsilon) or baseline_epsilon <= 0:
+        raise ValueError("baseline_epsilon must be finite and positive")
+    if predicted_pose.shape[1] < 2:
+        zero = predicted_pose.reshape(-1)[0] * 0.0
+        return {
+            "pairwise_pose": zero,
+            "pairwise_rotation": zero,
+            "pairwise_translation_direction": zero,
+            "pairwise_translation_magnitude": zero,
+            "pairwise_valid_direction_fraction": zero,
+            "pairwise_rotation_degrees": zero,
+            "pairwise_translation_direction_degrees": zero,
+            "rpa_5": zero,
+            "rpa_15": zero,
+            "rpa_30": zero,
+        }
+
+    predicted_quaternion = predicted_pose[..., 3:7]
+    quaternion_norm = torch.linalg.vector_norm(predicted_quaternion, dim=-1, keepdim=True)
+    identity_quaternion = torch.zeros_like(predicted_quaternion)
+    identity_quaternion[..., 3] = 1.0
+    safe_quaternion = torch.where(
+        quaternion_norm > baseline_epsilon,
+        predicted_quaternion,
+        identity_quaternion,
+    )
+    decoded_pose = torch.cat((predicted_pose[..., :3], safe_quaternion, predicted_pose[..., 7:]), dim=-1)
+    predicted_extrinsics, _ = encoding_to_camera(decoded_pose, image_size_hw, build_intrinsics=False)
+    target_extrinsics = target_extrinsics.to(device=predicted_pose.device, dtype=predicted_pose.dtype)
+    predicted_rotation, predicted_translation = _relative_pair_transforms(predicted_extrinsics)
+    target_rotation, target_translation = _relative_pair_transforms(target_extrinsics)
+
+    rotation_angles = _rotation_geodesic_radians(predicted_rotation, target_rotation)
+    rotation = rotation_angles.mean()
+    rotation_degrees = rotation_angles * (180 / math.pi)
+    predicted_magnitude = torch.linalg.vector_norm(predicted_translation, dim=-1)
+    target_magnitude = torch.linalg.vector_norm(target_translation, dim=-1)
+    magnitude = (predicted_magnitude - target_magnitude).abs().mean()
+    valid_direction = target_magnitude > baseline_epsilon
+    if bool(valid_direction.any()):
+        predicted_unit = predicted_translation / predicted_magnitude.clamp_min(baseline_epsilon).unsqueeze(-1)
+        target_unit = target_translation / target_magnitude.clamp_min(baseline_epsilon).unsqueeze(-1)
+        cross = torch.linalg.cross(predicted_unit, target_unit, dim=-1)
+        sine = torch.linalg.vector_norm(cross, dim=-1)
+        cosine = (predicted_unit * target_unit).sum(dim=-1).clamp(-1, 1)
+        direction_angles = torch.atan2(sine, cosine)
+        zero_prediction = predicted_magnitude <= baseline_epsilon
+        direction_angles = torch.where(zero_prediction & valid_direction, math.pi / 2, direction_angles)
+        direction = direction_angles[valid_direction].mean()
+        direction_degrees_values = direction_angles * (180 / math.pi)
+        direction_degrees = direction_degrees_values[valid_direction].mean()
+        rpa = {
+            threshold: (
+                (rotation_degrees[valid_direction] <= threshold)
+                & (direction_degrees_values[valid_direction] <= threshold)
+            )
+            .to(dtype=predicted_pose.dtype)
+            .mean()
+            for threshold in (5, 15, 30)
+        }
+    else:
+        direction = predicted_pose.reshape(-1)[0] * 0.0
+        direction_degrees = direction
+        rpa = dict.fromkeys((5, 15, 30), direction)
+    valid_fraction = valid_direction.to(dtype=predicted_pose.dtype).mean()
+    pairwise = (
+        float(rotation_weight) * rotation
+        + float(translation_direction_weight) * direction
+        + float(translation_magnitude_weight) * magnitude
+    )
+    return {
+        "pairwise_pose": pairwise,
+        "pairwise_rotation": rotation,
+        "pairwise_translation_direction": direction,
+        "pairwise_translation_magnitude": magnitude,
+        "pairwise_valid_direction_fraction": valid_fraction,
+        "pairwise_rotation_degrees": rotation_degrees.mean(),
+        "pairwise_translation_direction_degrees": direction_degrees,
+        "rpa_5": rpa[5],
+        "rpa_15": rpa[15],
+        "rpa_30": rpa[30],
+    }
+
+
 def compute_camera_depth_loss(
     predictions: Mapping[str, torch.Tensor],
     batch: Mapping[str, torch.Tensor],
@@ -116,6 +253,12 @@ def compute_camera_depth_loss(
     fov_weight: float = 0.5,
     min_valid_depth_pixels: int = 1,
     max_metric_depth_m: float | None = None,
+    relative_pose_weight: float = 0.0,
+    relative_rotation_weight: float = 1.0,
+    relative_translation_direction_weight: float = 1.0,
+    relative_translation_magnitude_weight: float = 1.0,
+    photometric_weight: float = 0.0,
+    renderer_options: Mapping[str, object] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the fixed weighted camera/depth objective for one normalized batch."""
 
@@ -131,6 +274,8 @@ def compute_camera_depth_loss(
         raise ValueError(f"batch images must have shape [B,S,3,H,W], got {tuple(images.shape)}")
     _validate_nonnegative_finite_weight("camera_weight", camera_weight)
     _validate_nonnegative_finite_weight("depth_weight", depth_weight)
+    _validate_nonnegative_finite_weight("relative_pose_weight", relative_pose_weight)
+    _validate_nonnegative_finite_weight("photometric_weight", photometric_weight)
 
     effective_depth_mask = depth_mask
     if max_metric_depth_m is not None:
@@ -168,8 +313,34 @@ def compute_camera_depth_loss(
         effective_depth_mask,
         min_valid_pixels=min_valid_depth_pixels,
     )
-    objective = float(camera_weight) * camera_losses["camera"] + float(depth_weight) * depth
-    return {**camera_losses, "depth": depth, "objective": objective}
+    pairwise_losses = compute_pairwise_pose_loss(
+        predicted_pose,
+        extrinsics,
+        (int(images.shape[-2]), int(images.shape[-1])),
+        rotation_weight=relative_rotation_weight,
+        translation_direction_weight=relative_translation_direction_weight,
+        translation_magnitude_weight=relative_translation_magnitude_weight,
+    )
+    objective = (
+        float(camera_weight) * camera_losses["camera"]
+        + float(depth_weight) * depth
+        + float(relative_pose_weight) * pairwise_losses["pairwise_pose"]
+    )
+    photometric_losses: dict[str, torch.Tensor] = {}
+    if photometric_weight > 0:
+        if renderer_options is None:
+            raise ValueError("renderer_options are required when photometric_weight is positive")
+        from vggt_omega.training.rendering import compute_sequence_photometric_loss
+
+        photometric_losses = compute_sequence_photometric_loss(predictions, batch, **dict(renderer_options))
+        objective = objective + float(photometric_weight) * photometric_losses["photometric"]
+    return {
+        **camera_losses,
+        "depth": depth,
+        **pairwise_losses,
+        **photometric_losses,
+        "objective": objective,
+    }
 
 
 def _validate_camera_inputs(

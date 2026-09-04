@@ -1,4 +1,4 @@
-name: colmap_rgbd
+name: colmap_rgbd_overlap
 root: ../vggt_training_data/colmap_rgbd_v1
 train_split: train
 val_split: val
@@ -10,7 +10,7 @@ num_workers: 2
 pin_memory: true
 min_valid_depth_pixels: 1024
 overlap_curriculum:
-  enabled: false
+  enabled: true
   metric: near_depth
   start_target: 0.24386708438396454
   end_target: 0.1284112185239792

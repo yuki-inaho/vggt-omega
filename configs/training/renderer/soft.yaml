@@ -1,0 +1,6 @@
+backend: soft
+relative_depth_tolerance: 0.03
+max_depth_m: 1.2
+pose_source: predicted
+use_target_depth: true
+z_temperature: 0.1

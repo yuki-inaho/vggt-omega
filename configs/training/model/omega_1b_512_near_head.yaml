@@ -1,0 +1,9 @@
+name: omega_1b_512
+pretrained_checkpoint: checkpoints/vggt_omega_1b_512.pt
+initial_head_checkpoint: outputs/training/2026-09-04/near-depth-1p2m-full/checkpoints/best_epoch_000001_19d1ef8812cc.pt
+image_height: 384
+image_width: 512
+patch_size: 16
+precision: bf16
+freeze_aggregator: true
+freeze_confidence: true

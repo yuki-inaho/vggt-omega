@@ -40,6 +40,32 @@ _CAMERA_COMPONENT_SCALAR_TAGS = frozenset(
         "val/camera_fov",
     }
 )
+_PAIRWISE_SCALAR_TAGS = frozenset(
+    {
+        "train/pairwise_pose",
+        "train/pairwise_rotation_degrees",
+        "train/pairwise_translation_direction_degrees",
+        "train/pairwise_translation_magnitude",
+        "train/rpa_5",
+        "train/rpa_15",
+        "train/rpa_30",
+        "val/pairwise_pose",
+        "val/pairwise_rotation_degrees",
+        "val/pairwise_translation_direction_degrees",
+        "val/pairwise_translation_magnitude",
+        "val/rpa_5",
+        "val/rpa_15",
+        "val/rpa_30",
+    }
+)
+_PHOTOMETRIC_SCALAR_TAGS = frozenset(
+    {
+        "train/photometric",
+        "train/photometric_visibility",
+        "val/photometric",
+        "val/photometric_visibility",
+    }
+)
 _HEX_DIGITS = frozenset("0123456789abcdef")
 _STANDARD_EARLY_STOPPING_CONFIG = {
     "enabled": False,
@@ -348,6 +374,21 @@ def _audit_tensorboard(
                 "camera_translation_focus",
             }:
                 required_tags = required_tags | _CAMERA_COMPONENT_SCALAR_TAGS
+            if loss_config:
+                training_loss = _nested_mapping(loss_config, "training")
+                validation_loss = _nested_mapping(loss_config, "validation")
+                training_pairwise = bool(training_loss and float(training_loss.get("relative_pose_weight", 0.0)) > 0)
+                validation_pairwise = bool(
+                    validation_loss and float(validation_loss.get("relative_pose_weight", 0.0)) > 0
+                )
+                if training_pairwise or validation_pairwise:
+                    required_tags = required_tags | _PAIRWISE_SCALAR_TAGS
+                training_photometric = bool(training_loss and float(training_loss.get("photometric_weight", 0.0)) > 0)
+                validation_photometric = bool(
+                    validation_loss and float(validation_loss.get("photometric_weight", 0.0)) > 0
+                )
+                if training_photometric or validation_photometric:
+                    required_tags = required_tags | _PHOTOMETRIC_SCALAR_TAGS
             if not scalar_tags >= required_tags:
                 state.error("tensorboard", "tensorboard_missing_scalar_tags")
             if not scalar_tags <= ALLOWED_SCALAR_TAGS:

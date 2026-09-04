@@ -37,9 +37,7 @@ COLMAP_CACHE_DIR = Path(os.environ.get("COLMAP_CACHE_DIR", Path.home() / ".cache
 
 DEFAULT_VGGT4D_CHECKPOINT = VGGT4D_REPO / "ckpts" / "model_tracker_fixed_e20.pt"
 DEFAULT_VGGT_OMEGA_CHECKPOINT = VGGT_OMEGA_REPO / "checkpoints" / "vggt_omega_1b_512.pt"
-DEFAULT_OPEND4RT_CHECKPOINT = (
-    OPEND4RT_REPO / "checkpoints" / "OpenD4RT_32CLIP_9Dataset_NoAUG" / "opend4rt.ckpt"
-)
+DEFAULT_OPEND4RT_CHECKPOINT = OPEND4RT_REPO / "checkpoints" / "OpenD4RT_32CLIP_9Dataset_NoAUG" / "opend4rt.ckpt"
 DEFAULT_MAMBAGLUE_CHECKPOINT = (
     MAMBAGLUE_REPO / ".cache" / "torch" / "hub" / "checkpoints" / "superpoint_mambaglue_v0.1.tar"
 )
@@ -908,13 +906,11 @@ def summarize_workflow(
             "selection_reason": "the accepted ALIKED+LightGlue alternative writes COLMAP-native descriptors and matches",
         },
         "colmap_aliked": _component_status(
-            COLMAP_CACHE_DIR
-            / "39c423d0a6f03d39ec89d3d1d61853765c2fb6a8b8381376c703e5758778a547-aliked-n16rot.onnx",
+            COLMAP_CACHE_DIR / "39c423d0a6f03d39ec89d3d1d61853765c2fb6a8b8381376c703e5758778a547-aliked-n16rot.onnx",
             "COLMAP ALIKED ONNX checkpoint has not been downloaded",
         ),
         "colmap_lightglue": _component_status(
-            COLMAP_CACHE_DIR
-            / "b9a5de7204648b18a8cf5dcac819f9d30de1a5961ef03756803c8b86c2dceb8d-aliked-lightglue.onnx",
+            COLMAP_CACHE_DIR / "b9a5de7204648b18a8cf5dcac819f9d30de1a5961ef03756803c8b86c2dceb8d-aliked-lightglue.onnx",
             "COLMAP ALIKED-LightGlue ONNX checkpoint has not been downloaded",
         ),
     }

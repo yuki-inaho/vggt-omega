@@ -16,6 +16,13 @@ _LOSS_WEIGHT_KEYS = (
     "rotation_weight",
     "fov_weight",
 )
+_OPTIONAL_LOSS_DEFAULTS = {
+    "relative_pose_weight": 0.0,
+    "relative_rotation_weight": 1.0,
+    "relative_translation_direction_weight": 1.0,
+    "relative_translation_magnitude_weight": 1.0,
+    "photometric_weight": 0.0,
+}
 _VALIDATION_MONITORS = {
     "val/objective",
     "val/camera",
@@ -23,6 +30,13 @@ _VALIDATION_MONITORS = {
     "val/camera_rotation",
     "val/camera_fov",
     "val/depth",
+    "val/pairwise_pose",
+    "val/pairwise_rotation_degrees",
+    "val/pairwise_translation_direction_degrees",
+    "val/pairwise_translation_magnitude",
+    "val/rpa_5",
+    "val/rpa_15",
+    "val/rpa_30",
 }
 
 
@@ -32,6 +46,13 @@ def _validate_loss_weights(value: object, owner: str) -> None:
     weights = cast(Mapping[str, object], value)
     for key in _LOSS_WEIGHT_KEYS:
         raw_weight = weights.get(key)
+        if isinstance(raw_weight, bool) or not isinstance(raw_weight, (int, float)):
+            raise ValueError(f"{owner}.{key} must be a finite non-negative number")
+        weight = float(raw_weight)
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(f"{owner}.{key} must be a finite non-negative number")
+    for key, default in _OPTIONAL_LOSS_DEFAULTS.items():
+        raw_weight = weights.get(key, default)
         if isinstance(raw_weight, bool) or not isinstance(raw_weight, (int, float)):
             raise ValueError(f"{owner}.{key} must be a finite non-negative number")
         weight = float(raw_weight)
@@ -67,6 +88,20 @@ def validate_training_config(cfg: DictConfig) -> None:
         raise ValueError("trainer.sequence_frames must be within the configured data frame range")
     if int(cfg.data.batch_size) > 1 and sequence_frames is None and min_frames != max_frames:
         raise ValueError("variable-length frame sampling currently requires data.batch_size=1")
+    overlap = cfg.data.overlap_curriculum
+    if not isinstance(overlap.enabled, bool):
+        raise ValueError("data.overlap_curriculum.enabled must be boolean")
+    if str(overlap.metric) not in {"all_depth", "near_depth"}:
+        raise ValueError("data.overlap_curriculum.metric must be all_depth or near_depth")
+    overlap_start = float(overlap.start_target)
+    overlap_end = float(overlap.end_target)
+    overlap_tolerance = float(overlap.target_tolerance)
+    if not math.isfinite(overlap_start) or not math.isfinite(overlap_end) or not 0 <= overlap_end <= overlap_start <= 1:
+        raise ValueError("overlap curriculum targets must satisfy 0 <= end <= start <= 1")
+    if not math.isfinite(overlap_tolerance) or overlap_tolerance < 0:
+        raise ValueError("overlap curriculum target_tolerance must be finite and non-negative")
+    if isinstance(overlap.epochs, bool) or int(overlap.epochs) < 1:
+        raise ValueError("overlap curriculum epochs must be at least 1")
 
     if int(cfg.checkpoint.k) < 1:
         raise ValueError(f"checkpoint.k must be at least 1, got {cfg.checkpoint.k}")
@@ -98,6 +133,30 @@ def validate_training_config(cfg: DictConfig) -> None:
         raise ValueError("trainer.device must be 'cpu' or 'cuda'")
     if str(cfg.model.precision) not in {"fp32", "bf16"}:
         raise ValueError("model.precision must be 'fp32' or 'bf16'")
+    renderer_backend = str(cfg.renderer.backend)
+    if renderer_backend not in {"soft", "gsplat"}:
+        raise ValueError("renderer.backend must be soft or gsplat")
+    renderer_tolerance = float(cfg.renderer.relative_depth_tolerance)
+    renderer_max_depth = float(cfg.renderer.max_depth_m)
+    if not math.isfinite(renderer_tolerance) or renderer_tolerance <= 0:
+        raise ValueError("renderer.relative_depth_tolerance must be finite and positive")
+    if not math.isfinite(renderer_max_depth) or renderer_max_depth <= 0:
+        raise ValueError("renderer.max_depth_m must be finite and positive")
+    if str(cfg.renderer.pose_source) not in {"predicted", "ground_truth"}:
+        raise ValueError("renderer.pose_source must be predicted or ground_truth")
+    if not isinstance(cfg.renderer.use_target_depth, bool):
+        raise ValueError("renderer.use_target_depth must be boolean")
+    if renderer_backend == "soft":
+        temperature = float(cfg.renderer.z_temperature)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("renderer.z_temperature must be finite and positive")
+    else:
+        radius = float(cfg.renderer.gaussian_radius_pixels)
+        opacity = float(cfg.renderer.opacity)
+        if not math.isfinite(radius) or radius <= 0:
+            raise ValueError("renderer.gaussian_radius_pixels must be finite and positive")
+        if not math.isfinite(opacity) or not 0 < opacity <= 1:
+            raise ValueError("renderer.opacity must be finite and within (0, 1]")
     if float(cfg.trainer.gradient_clip_norm) <= 0:
         raise ValueError("trainer.gradient_clip_norm must be positive")
     if int(cfg.trainer.epochs) < 1:

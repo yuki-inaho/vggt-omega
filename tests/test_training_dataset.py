@@ -14,9 +14,15 @@ from scripts.prepare_colmap_rgbd_training import (
     compute_principal_crop,
     export_colmap_rgbd_training,
     main,
+    prepare_overlap_profile,
     validate_staging,
 )
-from vggt_omega.training.dataset import ColmapRgbdDataset, DataContractError
+from vggt_omega.training.dataset import (
+    ColmapRgbdDataset,
+    DataContractError,
+    overlap_curriculum_target,
+    select_overlap_frame_offsets,
+)
 
 PRIVATE_TOKEN = "private-session-7a7e56ff-customer"
 
@@ -129,6 +135,58 @@ def test_exporter_reencodes_private_source_to_generic_regular_files(exported_sta
         assert cameras["extrinsics_w2c"][4, 0, 3] == pytest.approx(-0.04)
     exported_depth = np.asarray(Image.open(exported_staging / "scenes/scene_000000/depth/frame_000000.png"))
     assert np.count_nonzero(exported_depth) == 1, "export must not apply a second dilation"
+
+
+def test_exporter_writes_anonymous_numeric_overlap_profile(exported_staging: Path) -> None:
+    metadata = json.loads((exported_staging / "dataset.json").read_text())
+    assert metadata["overlap"] == {
+        "aggregation": "bidirectional_mean",
+        "filename": "overlap.npz",
+        "near_depth_m": 1.2,
+        "pixel_stride": 8,
+        "relative_depth_tolerance": 0.03,
+        "schema_version": 1,
+    }
+    profile_path = exported_staging / "scenes/scene_000000/overlap.npz"
+    with np.load(profile_path, allow_pickle=False) as profile:
+        assert set(profile.files) == {"all_depth", "near_depth", "pair_valid"}
+        all_depth = profile["all_depth"]
+        near_depth = profile["near_depth"]
+        pair_valid = profile["pair_valid"]
+    with np.load(exported_staging / "scenes/scene_000000/sequences.npz", allow_pickle=False) as sequences:
+        sequence_count, max_frames = sequences["sequences"].shape
+        expected_shape = (sequence_count, max_frames, max_frames)
+    assert all_depth.shape == expected_shape
+    assert near_depth.shape == expected_shape
+    assert pair_valid.shape == expected_shape
+    assert all_depth.dtype == np.float32
+    assert near_depth.dtype == np.float32
+    assert pair_valid.dtype == np.bool_
+    assert np.isfinite(all_depth).all() and np.isfinite(near_depth).all()
+    assert ((all_depth >= 0) & (all_depth <= 1)).all()
+    assert ((near_depth >= 0) & (near_depth <= 1)).all()
+    assert np.allclose(all_depth, all_depth.transpose(0, 2, 1))
+    assert np.allclose(near_depth, near_depth.transpose(0, 2, 1))
+    assert not np.diagonal(pair_valid, axis1=1, axis2=2).any()
+    assert PRIVATE_TOKEN.encode() not in profile_path.read_bytes()
+
+
+def test_existing_anonymous_staging_can_be_upgraded_with_overlap_profile(exported_staging: Path) -> None:
+    profile_path = exported_staging / "scenes/scene_000000/overlap.npz"
+    profile_path.unlink()
+    metadata_path = exported_staging / "dataset.json"
+    metadata = json.loads(metadata_path.read_text())
+    del metadata["overlap"]
+    metadata_path.write_text(json.dumps(metadata))
+
+    report = prepare_overlap_profile(exported_staging)
+
+    assert report["valid"]
+    assert profile_path.is_file() and not profile_path.is_symlink()
+    assert validate_staging(exported_staging)["valid"]
+    assert all(
+        PRIVATE_TOKEN.encode() not in path.read_bytes() for path in exported_staging.rglob("*") if path.is_file()
+    )
 
 
 def test_staging_validator_rejects_paths_names_symlinks_and_png_metadata(exported_staging: Path) -> None:
@@ -315,3 +373,92 @@ def test_loader_rejects_metadata_that_claims_a_second_depth_dilation(exported_st
 
     with pytest.raises(DataContractError, match="mapped-depth contract"):
         ColmapRgbdDataset(exported_staging, split="train")
+
+
+@pytest.mark.parametrize("missing", ["metadata", "file"])
+def test_loader_rejects_missing_overlap_profile_without_random_fallback(exported_staging: Path, missing: str) -> None:
+    if missing == "metadata":
+        metadata_path = exported_staging / "dataset.json"
+        metadata = json.loads(metadata_path.read_text())
+        del metadata["overlap"]
+        metadata_path.write_text(json.dumps(metadata))
+    else:
+        (exported_staging / "scenes/scene_000000/overlap.npz").unlink()
+
+    with pytest.raises(DataContractError, match="overlap profile"):
+        ColmapRgbdDataset(exported_staging, split="train")
+
+
+def test_overlap_curriculum_target_covers_start_middle_and_end() -> None:
+    assert overlap_curriculum_target(0, 5, start_target=0.8, end_target=0.2) == pytest.approx(0.8)
+    assert overlap_curriculum_target(2, 5, start_target=0.8, end_target=0.2) == pytest.approx(0.5)
+    assert overlap_curriculum_target(4, 5, start_target=0.8, end_target=0.2) == pytest.approx(0.2)
+    assert overlap_curriculum_target(9, 5, start_target=0.8, end_target=0.2) == pytest.approx(0.2)
+
+
+def test_overlap_selector_uses_target_range_then_explicit_nearest_fallback() -> None:
+    scores = np.asarray([[0.0, 0.8, 0.2], [0.8, 0.0, 0.5], [0.2, 0.5, 0.0]], dtype=np.float32)
+    valid = np.asarray([[False, True, True], [True, False, True], [True, True, False]], dtype=np.bool_)
+
+    selected, score, fallback = select_overlap_frame_offsets(
+        scores, valid, sample_length=2, target=0.78, tolerance=0.03, rng=np.random.default_rng(4)
+    )
+    nearest, nearest_score, nearest_fallback = select_overlap_frame_offsets(
+        scores, valid, sample_length=2, target=0.95, tolerance=0.01, rng=np.random.default_rng(4)
+    )
+
+    assert set(selected.tolist()) == {0, 1}
+    assert score == pytest.approx(0.8)
+    assert not fallback
+    assert set(nearest.tolist()) == {0, 1}
+    assert nearest_score == pytest.approx(0.8)
+    assert nearest_fallback
+
+
+def test_overlap_dataset_is_reproducible_with_multiple_workers(exported_staging: Path) -> None:
+    options = {
+        "split": "train",
+        "min_frames": 2,
+        "max_frames": 3,
+        "seed": 17,
+        "overlap_curriculum_enabled": True,
+        "overlap_start_target": 0.8,
+        "overlap_end_target": 0.2,
+        "overlap_target_tolerance": 0.05,
+        "overlap_curriculum_epochs": 3,
+    }
+    first = ColmapRgbdDataset(exported_staging, **options)
+    second = ColmapRgbdDataset(exported_staging, **options)
+    first.set_epoch(1)
+    second.set_epoch(1)
+
+    first_batches = list(DataLoader(first, batch_size=1, shuffle=False, num_workers=2))
+    second_batches = list(DataLoader(second, batch_size=1, shuffle=False, num_workers=2))
+
+    assert len(first_batches) == len(second_batches)
+    for left, right in zip(first_batches, second_batches, strict=True):
+        assert torch.equal(left["frame_ids"], right["frame_ids"])
+        assert torch.equal(left["sampling_overlap_score"], right["sampling_overlap_score"])
+        assert torch.equal(left["sampling_overlap_target"], right["sampling_overlap_target"])
+        assert torch.equal(left["sampling_overlap_fallback"], right["sampling_overlap_fallback"])
+
+
+def test_overlap_curriculum_can_be_enabled_for_smoke_training_split(exported_staging: Path) -> None:
+    dataset = ColmapRgbdDataset(
+        exported_staging,
+        split="smoke",
+        min_frames=2,
+        max_frames=2,
+        overlap_curriculum_enabled=True,
+        overlap_start_target=0.8,
+        overlap_end_target=0.2,
+        overlap_curriculum_epochs=3,
+    )
+
+    sample = dataset[0]
+
+    assert set(sample) >= {
+        "sampling_overlap_score",
+        "sampling_overlap_target",
+        "sampling_overlap_fallback",
+    }

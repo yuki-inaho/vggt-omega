@@ -12,19 +12,23 @@ import json
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from functools import lru_cache
 from itertools import combinations, pairwise
 from pathlib import Path
 from typing import Any, cast
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
+
+from vggt_omega.training.overlap import bidirectional_rgbd_overlap
 
 DATASET_FORMAT = "colmap_rgbd_v1"
 SCENE_NAME = "scene_000000"
 SPLIT_NAMES = ("train", "val", "smoke")
 _SCENE_FILE = re.compile(r"scenes/scene_\d{6}/(?:rgb|depth)/frame_\d{6}\.png$")
-_SCENE_ARRAY = re.compile(r"scenes/scene_\d{6}/(?:cameras|sequences)\.npz$")
+_SCENE_ARRAY = re.compile(r"scenes/scene_\d{6}/(?:cameras|sequences|overlap)\.npz$")
 _SPLIT_FILE = re.compile(r"splits/(?:train|val|smoke)\.txt$")
 _SEQUENCE_ENTRY = re.compile(r"scene_\d{6}/sequence_(\d{6})$")
 _GENERIC_PRIVATE_PATTERNS = (
@@ -327,6 +331,85 @@ def _write_split_files(root: Path, sequence_splits: np.ndarray) -> None:
         sequence_ids = np.flatnonzero(sequence_splits == split_id)
         content = "".join(f"{SCENE_NAME}/sequence_{int(index):06d}\n" for index in sequence_ids)
         (split_dir / f"{split_name}.txt").write_text(content)
+
+
+def _write_overlap_profile(
+    root: Path,
+    sequences: np.ndarray,
+    lengths: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics_w2c: np.ndarray,
+    *,
+    relative_depth_tolerance: float,
+    pixel_stride: int,
+    near_depth_m: float,
+) -> None:
+    """Write numeric-only pair-overlap arrays for anonymous sequences."""
+
+    if relative_depth_tolerance <= 0 or pixel_stride < 1 or near_depth_m <= 0:
+        raise ExportContractError("overlap profile options must be positive")
+    sequence_count, max_frames = sequences.shape
+    all_depth = np.zeros((sequence_count, max_frames, max_frames), dtype=np.float32)
+    near_depth = np.zeros_like(all_depth)
+    pair_valid = np.zeros((sequence_count, max_frames, max_frames), dtype=np.bool_)
+    scene_root = root / f"scenes/{SCENE_NAME}"
+
+    @lru_cache(maxsize=16)
+    def load_depth(frame_id: int) -> torch.Tensor:
+        path = scene_root / "depth" / f"frame_{frame_id:06d}.png"
+        try:
+            with Image.open(path) as image:
+                depth = np.array(image, dtype=np.uint16, copy=True)
+        except (OSError, ValueError) as error:
+            raise ExportContractError(f"generic depth frame {frame_id} cannot be read for overlap") from error
+        return torch.from_numpy(depth.astype(np.float32)).div_(1000)
+
+    cached_pairs: dict[tuple[int, int], tuple[float, float]] = {}
+    camera_intrinsics = torch.from_numpy(np.asarray(intrinsics, dtype=np.float32))
+    camera_extrinsics = torch.from_numpy(np.asarray(extrinsics_w2c, dtype=np.float32))
+    for sequence_id, (row, length) in enumerate(zip(sequences, lengths, strict=True)):
+        count = int(length)
+        for first_offset in range(count):
+            for second_offset in range(first_offset + 1, count):
+                first_id = int(row[first_offset])
+                second_id = int(row[second_offset])
+                pair_key = (min(first_id, second_id), max(first_id, second_id))
+                if pair_key not in cached_pairs:
+                    first_depth = load_depth(pair_key[0])
+                    second_depth = load_depth(pair_key[1])
+                    arguments = (
+                        first_depth,
+                        second_depth,
+                        camera_intrinsics[pair_key[0]],
+                        camera_intrinsics[pair_key[1]],
+                        camera_extrinsics[pair_key[0]],
+                        camera_extrinsics[pair_key[1]],
+                    )
+                    score_all = bidirectional_rgbd_overlap(
+                        *arguments,
+                        relative_depth_tolerance=relative_depth_tolerance,
+                        pixel_stride=pixel_stride,
+                    )
+                    score_near = bidirectional_rgbd_overlap(
+                        *arguments,
+                        relative_depth_tolerance=relative_depth_tolerance,
+                        pixel_stride=pixel_stride,
+                        max_depth_m=near_depth_m,
+                    )
+                    cached_pairs[pair_key] = (float(score_all), float(score_near))
+                score_all, score_near = cached_pairs[pair_key]
+                all_depth[sequence_id, first_offset, second_offset] = score_all
+                all_depth[sequence_id, second_offset, first_offset] = score_all
+                near_depth[sequence_id, first_offset, second_offset] = score_near
+                near_depth[sequence_id, second_offset, first_offset] = score_near
+                pair_valid[sequence_id, first_offset, second_offset] = True
+                pair_valid[sequence_id, second_offset, first_offset] = True
+    np.savez_compressed(
+        scene_root / "overlap.npz",
+        all_depth=all_depth,
+        near_depth=near_depth,
+        pair_valid=pair_valid,
+    )
 
 
 def _private_tokens(
@@ -646,6 +729,7 @@ def validate_staging(
             "depth",
             "camera",
             "sequences",
+            "overlap",
             "splits",
         }:
             raise ValueError("dataset metadata contains unexpected fields")
@@ -653,6 +737,7 @@ def validate_staging(
         depth_metadata = dataset["depth"]
         camera_metadata = dataset["camera"]
         sequence_metadata = dataset["sequences"]
+        overlap_metadata = dataset["overlap"]
         split_metadata = dataset["splits"]
         if (
             set(image_metadata) != {"height", "width", "channels", "dtype"}
@@ -677,6 +762,15 @@ def validate_staging(
                 "max_rotation_deg",
                 "guard_frames",
             }
+            or set(overlap_metadata)
+            != {
+                "schema_version",
+                "filename",
+                "aggregation",
+                "relative_depth_tolerance",
+                "pixel_stride",
+                "near_depth_m",
+            }
             or set(split_metadata) != set(SPLIT_NAMES)
         ):
             raise ValueError("dataset nested metadata contains unexpected fields")
@@ -695,6 +789,40 @@ def validate_staging(
             quality_flags = cameras["quality_flags"]
             chunk_ids = cameras["chunk_ids"]
         rotations = extrinsics[:, :3, :3]
+        sequence_path = root / f"scenes/{SCENE_NAME}/sequences.npz"
+        with np.load(sequence_path, allow_pickle=False) as sequence_arrays:
+            sequence_shape = sequence_arrays["sequences"].shape
+            sequence_lengths = sequence_arrays["lengths"]
+        overlap_path = root / f"scenes/{SCENE_NAME}/{overlap_metadata['filename']}"
+        with np.load(overlap_path, allow_pickle=False) as profile:
+            if set(profile.files) != {"all_depth", "near_depth", "pair_valid"}:
+                raise ValueError("unexpected overlap arrays")
+            overlap_all = profile["all_depth"]
+            overlap_near = profile["near_depth"]
+            overlap_valid = profile["pair_valid"]
+        expected_overlap_shape = (sequence_shape[0], sequence_shape[1], sequence_shape[1])
+        expected_pair_valid = np.zeros(expected_overlap_shape, dtype=np.bool_)
+        for sequence_id, length in enumerate(sequence_lengths):
+            count = int(length)
+            expected_pair_valid[sequence_id, :count, :count] = True
+            np.fill_diagonal(expected_pair_valid[sequence_id], False)
+        overlap_arrays_ok = bool(
+            overlap_all.shape == expected_overlap_shape
+            and overlap_near.shape == expected_overlap_shape
+            and overlap_valid.shape == expected_overlap_shape
+            and overlap_all.dtype == np.float32
+            and overlap_near.dtype == np.float32
+            and overlap_valid.dtype == np.bool_
+            and np.isfinite(overlap_all).all()
+            and np.isfinite(overlap_near).all()
+            and ((overlap_all >= 0) & (overlap_all <= 1)).all()
+            and ((overlap_near >= 0) & (overlap_near <= 1)).all()
+            and np.allclose(overlap_all, overlap_all.transpose(0, 2, 1), atol=1e-6)
+            and np.allclose(overlap_near, overlap_near.transpose(0, 2, 1), atol=1e-6)
+            and np.array_equal(overlap_valid, expected_pair_valid)
+            and np.all(overlap_all[~overlap_valid] == 0)
+            and np.all(overlap_near[~overlap_valid] == 0)
+        )
         camera_arrays_ok = bool(
             frame_ids.shape == (camera_count,)
             and frame_ids.dtype == np.int64
@@ -740,6 +868,17 @@ def validate_staging(
             and camera_metadata.get("extrinsics") == "opencv_world_to_camera"
             and camera_metadata.get("intrinsics") == "pixel_units"
             and camera_metadata.get("source") == "aligned_trajectory_camera_to_world_inverted"
+            and overlap_metadata.get("schema_version") == 1
+            and overlap_metadata.get("filename") == "overlap.npz"
+            and overlap_metadata.get("aggregation") == "bidirectional_mean"
+            and math.isfinite(float(overlap_metadata.get("relative_depth_tolerance", 0)))
+            and float(overlap_metadata.get("relative_depth_tolerance", 0)) > 0
+            and isinstance(overlap_metadata.get("pixel_stride"), int)
+            and not isinstance(overlap_metadata.get("pixel_stride"), bool)
+            and int(overlap_metadata.get("pixel_stride", 0)) > 0
+            and math.isfinite(float(overlap_metadata.get("near_depth_m", 0)))
+            and float(overlap_metadata.get("near_depth_m", 0)) > 0
+            and overlap_arrays_ok
         )
         frame_contract_violation_count = _validate_png_contract(
             root,
@@ -913,6 +1052,19 @@ def export_colmap_rgbd_training(
         split_ids=sequence_splits,
         chunk_ids=sequence_chunks,
     )
+    overlap_relative_depth_tolerance = 0.03
+    overlap_pixel_stride = 8
+    overlap_near_depth_m = 1.2
+    _write_overlap_profile(
+        output_root,
+        sequences,
+        sequence_lengths,
+        repeated_intrinsics,
+        extrinsics,
+        relative_depth_tolerance=overlap_relative_depth_tolerance,
+        pixel_stride=overlap_pixel_stride,
+        near_depth_m=overlap_near_depth_m,
+    )
     _write_split_files(output_root, sequence_splits)
     dataset = {
         "schema_version": 1,
@@ -943,6 +1095,14 @@ def export_colmap_rgbd_training(
             "max_rotation_deg": max_rotation_deg,
             "guard_frames": guard_frames,
         },
+        "overlap": {
+            "schema_version": 1,
+            "filename": "overlap.npz",
+            "aggregation": "bidirectional_mean",
+            "relative_depth_tolerance": overlap_relative_depth_tolerance,
+            "pixel_stride": overlap_pixel_stride,
+            "near_depth_m": overlap_near_depth_m,
+        },
         "splits": {name: int(np.sum(sequence_splits == index)) for index, name in enumerate(SPLIT_NAMES)},
     }
     (output_root / "dataset.json").write_text(json.dumps(dataset, indent=2, sort_keys=True) + "\n")
@@ -959,6 +1119,66 @@ def export_colmap_rgbd_training(
     return report
 
 
+def prepare_overlap_profile(
+    output_root: Path,
+    *,
+    relative_depth_tolerance: float = 0.03,
+    pixel_stride: int = 8,
+    near_depth_m: float = 1.2,
+) -> dict[str, Any]:
+    """Upgrade an existing anonymous staging set with a numeric overlap profile."""
+
+    output_root = Path(output_root)
+    dataset_path = output_root / "dataset.json"
+    scene_root = output_root / f"scenes/{SCENE_NAME}"
+    overlap_path = scene_root / "overlap.npz"
+    try:
+        dataset = json.loads(dataset_path.read_text())
+    except (OSError, ValueError) as error:
+        raise ExportContractError("dataset.json is missing or invalid") from error
+    if not isinstance(dataset, dict) or dataset.get("format") != DATASET_FORMAT:
+        raise ExportContractError("dataset format is not the supported anonymous staging contract")
+    if "overlap" in dataset or overlap_path.exists():
+        raise ExportContractError("overlap profile already exists; refusing to overwrite it")
+    try:
+        with np.load(scene_root / "cameras.npz", allow_pickle=False) as cameras:
+            if set(cameras.files) != {"frame_ids", "intrinsics", "extrinsics_w2c", "quality_flags", "chunk_ids"}:
+                raise ValueError("unexpected camera arrays")
+            intrinsics = cameras["intrinsics"].copy()
+            extrinsics = cameras["extrinsics_w2c"].copy()
+        with np.load(scene_root / "sequences.npz", allow_pickle=False) as stored_sequences:
+            if set(stored_sequences.files) != {"sequences", "lengths", "split_ids", "chunk_ids"}:
+                raise ValueError("unexpected sequence arrays")
+            sequences = stored_sequences["sequences"].copy()
+            lengths = stored_sequences["lengths"].copy()
+    except (OSError, ValueError, KeyError) as error:
+        raise ExportContractError("anonymous camera or sequence arrays are invalid") from error
+    _write_overlap_profile(
+        output_root,
+        sequences,
+        lengths,
+        intrinsics,
+        extrinsics,
+        relative_depth_tolerance=relative_depth_tolerance,
+        pixel_stride=pixel_stride,
+        near_depth_m=near_depth_m,
+    )
+    dataset["overlap"] = {
+        "schema_version": 1,
+        "filename": "overlap.npz",
+        "aggregation": "bidirectional_mean",
+        "relative_depth_tolerance": relative_depth_tolerance,
+        "pixel_stride": pixel_stride,
+        "near_depth_m": near_depth_m,
+    }
+    dataset_path.write_text(json.dumps(dataset, indent=2, sort_keys=True) + "\n")
+    report = validate_staging(output_root)
+    (output_root / "reports/export_validation.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    if not report["valid"]:
+        raise ExportContractError("overlap profile upgrade failed strict staging validation")
+    return report
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-rgbd-root", type=Path)
@@ -966,6 +1186,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb-camera-yaml", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--prepare-overlap-profile", action="store_true")
     parser.add_argument("--private-token", action="append", default=[])
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=512)
@@ -980,6 +1201,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.validate_only and args.prepare_overlap_profile:
+        print("error: --validate-only and --prepare-overlap-profile are mutually exclusive")
+        return 2
+    if args.prepare_overlap_profile:
+        try:
+            report = prepare_overlap_profile(args.output_root)
+        except (ExportContractError, OSError, ValueError) as error:
+            print(f"error: {error}")
+            return 2
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
     if args.validate_only:
         source_arguments = (args.source_rgbd_root, args.trajectory, args.rgb_camera_yaml)
         if any(argument is not None for argument in source_arguments) and not all(

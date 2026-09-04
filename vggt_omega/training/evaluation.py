@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from vggt_omega.training.dataset import ColmapRgbdDataset
 from vggt_omega.training.model_factory import PreparedTrainingModel, build_training_model
-from vggt_omega.training.runner import validate_one_epoch
+from vggt_omega.training.runner import _renderer_options, validate_one_epoch
 
 ModelFactory = Callable[..., PreparedTrainingModel]
 Validator = Callable[..., Mapping[str, float]]
@@ -32,6 +32,13 @@ _MONITOR_TO_METRIC = {
     "val/camera_rotation": "camera_rotation",
     "val/camera_fov": "camera_fov",
     "val/depth": "depth",
+    "val/pairwise_pose": "pairwise_pose",
+    "val/pairwise_rotation_degrees": "pairwise_rotation_degrees",
+    "val/pairwise_translation_direction_degrees": "pairwise_translation_direction_degrees",
+    "val/pairwise_translation_magnitude": "pairwise_translation_magnitude",
+    "val/rpa_5": "rpa_5",
+    "val/rpa_15": "rpa_15",
+    "val/rpa_30": "rpa_30",
 }
 _LOSS_WEIGHT_KEYS = (
     "camera_weight",
@@ -40,6 +47,13 @@ _LOSS_WEIGHT_KEYS = (
     "rotation_weight",
     "fov_weight",
 )
+_OPTIONAL_LOSS_DEFAULTS = {
+    "relative_pose_weight": 0.0,
+    "relative_rotation_weight": 1.0,
+    "relative_translation_direction_weight": 1.0,
+    "relative_translation_magnitude_weight": 1.0,
+    "photometric_weight": 0.0,
+}
 _STANDARD_EARLY_STOPPING_CONFIG = {
     "enabled": False,
     "monitor": "val/objective",
@@ -489,6 +503,11 @@ def _validation_loss_options(config: Mapping[str, Any]) -> dict[str, float] | No
         options[key] = _finite_float(validation.get(key), f"loss.validation.{key}")
         if options[key] < 0:
             raise EvaluationError(f"loss.validation.{key} must be non-negative")
+    for key in _OPTIONAL_LOSS_DEFAULTS:
+        if key in validation:
+            options[key] = _finite_float(validation.get(key), f"loss.validation.{key}")
+            if options[key] < 0:
+                raise EvaluationError(f"loss.validation.{key} must be non-negative")
     max_metric_depth_m = validation.get("max_metric_depth_m")
     if max_metric_depth_m is not None:
         options["max_metric_depth_m"] = _finite_float(
@@ -737,6 +756,16 @@ def evaluate_training_checkpoints(
     selected_dataset_factory = dataset_factory or ColmapRgbdDataset
     dataset, validation_options = _validation_dataset(resolved_config, cwd, selected_dataset_factory)
     validation_loss_options = _validation_loss_options(resolved_config)
+    renderer_config = resolved_config.get("renderer")
+    validation_renderer_options = (
+        _renderer_options(cast(Mapping[str, Any], renderer_config)) if isinstance(renderer_config, Mapping) else None
+    )
+    if (
+        validation_loss_options
+        and validation_loss_options.get("photometric_weight", 0.0) > 0
+        and validation_renderer_options is None
+    ):
+        raise EvaluationError("renderer configuration is required for photometric validation")
     selected_validator = validator or validate_one_epoch
     checkpoint_reports: list[dict[str, Any]] = []
     for entry in entries:
@@ -766,6 +795,7 @@ def evaluate_training_checkpoints(
                 max_batches=validation_options["max_batches"],
                 precision="bf16",
                 loss_options=validation_loss_options,
+                renderer_options=validation_renderer_options,
                 depth_thresholds_m=validated_thresholds_m,
             )
         )

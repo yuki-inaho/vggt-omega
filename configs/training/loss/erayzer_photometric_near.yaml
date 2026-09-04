@@ -1,0 +1,62 @@
+name: erayzer_photometric_near
+training:
+  camera_weight: 5.0
+  depth_weight: 4.0
+  translation_weight: 1.0
+  rotation_weight: 1.0
+  fov_weight: 0.5
+  max_metric_depth_m: 1.2
+  relative_pose_weight: 0.02
+  relative_rotation_weight: 1.0
+  relative_translation_direction_weight: 1.0
+  relative_translation_magnitude_weight: 1.0
+  photometric_weight: 0.01
+curriculum:
+  - start_epoch: 0
+    camera_weight: 5.0
+    depth_weight: 4.0
+    translation_weight: 1.0
+    rotation_weight: 1.0
+    fov_weight: 0.5
+    max_metric_depth_m: 1.2
+    relative_pose_weight: 0.02
+    relative_rotation_weight: 1.0
+    relative_translation_direction_weight: 1.0
+    relative_translation_magnitude_weight: 1.0
+    photometric_weight: 0.01
+  - start_epoch: 1
+    camera_weight: 5.0
+    depth_weight: 4.0
+    translation_weight: 1.0
+    rotation_weight: 1.0
+    fov_weight: 0.5
+    max_metric_depth_m: 1.2
+    relative_pose_weight: 0.05
+    relative_rotation_weight: 1.0
+    relative_translation_direction_weight: 1.0
+    relative_translation_magnitude_weight: 1.0
+    photometric_weight: 0.01
+  - start_epoch: 2
+    camera_weight: 5.0
+    depth_weight: 4.0
+    translation_weight: 1.0
+    rotation_weight: 1.0
+    fov_weight: 0.5
+    max_metric_depth_m: 1.2
+    relative_pose_weight: 0.1
+    relative_rotation_weight: 1.0
+    relative_translation_direction_weight: 1.0
+    relative_translation_magnitude_weight: 1.0
+    photometric_weight: 0.01
+validation:
+  camera_weight: 5.0
+  depth_weight: 1.0
+  translation_weight: 1.0
+  rotation_weight: 1.0
+  fov_weight: 0.5
+  max_metric_depth_m: 1.2
+  relative_pose_weight: 0.1
+  relative_rotation_weight: 1.0
+  relative_translation_direction_weight: 1.0
+  relative_translation_magnitude_weight: 1.0
+  photometric_weight: 0.01

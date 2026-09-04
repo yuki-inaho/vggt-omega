@@ -10,6 +10,7 @@ from vggt_omega.training.losses import (
     compute_camera_depth_loss,
     compute_camera_loss,
     compute_depth_loss,
+    compute_pairwise_pose_loss,
 )
 
 
@@ -252,3 +253,108 @@ def test_losses_reject_shapes_that_would_otherwise_broadcast() -> None:
     mask = torch.ones(1, 1, 2, 2, dtype=torch.bool)
     with pytest.raises(ValueError, match="target_depth"):
         compute_depth_loss(prediction, target, mask)
+
+
+def _two_camera_setup() -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+    extrinsics = torch.eye(4, dtype=torch.float32)[None, None, :3].repeat(1, 2, 1, 1)
+    extrinsics[0, 1, 0, 3] = 1.0
+    intrinsics = torch.eye(3, dtype=torch.float32)[None, None].repeat(1, 2, 1, 1)
+    intrinsics[..., 0, 0] = 4.0
+    intrinsics[..., 1, 1] = 4.0
+    intrinsics[..., 0, 2] = 4.0
+    intrinsics[..., 1, 2] = 2.0
+    return extrinsics, intrinsics, (4, 8)
+
+
+def test_pairwise_pose_loss_is_zero_for_exact_pose_and_quaternion_sign() -> None:
+    extrinsics, intrinsics, image_size = _two_camera_setup()
+    pose = build_camera_pose_target(extrinsics, intrinsics, image_size)
+
+    exact = compute_pairwise_pose_loss(pose, extrinsics, image_size)
+    sign_flipped = pose.clone()
+    sign_flipped[..., 3:7] *= -1
+    flipped = compute_pairwise_pose_loss(sign_flipped, extrinsics, image_size)
+
+    assert exact["pairwise_pose"].item() == pytest.approx(0.0, abs=1e-6)
+    assert flipped["pairwise_rotation"].item() == pytest.approx(0.0, abs=1e-6)
+    assert exact["rpa_5"].item() == pytest.approx(1.0)
+    assert exact["rpa_15"].item() == pytest.approx(1.0)
+    assert exact["rpa_30"].item() == pytest.approx(1.0)
+
+
+def test_pairwise_pose_loss_matches_known_rotation_and_translation_direction() -> None:
+    extrinsics, intrinsics, image_size = _two_camera_setup()
+    predicted_extrinsics = extrinsics.clone()
+    predicted_extrinsics[0, 1, :3, :3] = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32
+    )
+    predicted_extrinsics[0, 1, :3, 3] = torch.tensor([0.0, 1.0, 0.0])
+    predicted_pose = build_camera_pose_target(predicted_extrinsics, intrinsics, image_size)
+
+    losses = compute_pairwise_pose_loss(predicted_pose, extrinsics, image_size)
+
+    assert losses["pairwise_rotation"].item() == pytest.approx(math.pi / 2, rel=1e-5)
+    assert losses["pairwise_translation_direction"].item() == pytest.approx(math.pi / 2, rel=1e-5)
+    assert losses["pairwise_translation_magnitude"].item() == pytest.approx(0.0, abs=1e-6)
+    assert losses["pairwise_valid_direction_fraction"].item() == pytest.approx(1.0)
+    assert losses["pairwise_rotation_degrees"].item() == pytest.approx(90.0, rel=1e-5)
+    assert losses["pairwise_translation_direction_degrees"].item() == pytest.approx(90.0, rel=1e-5)
+    assert losses["rpa_5"].item() == pytest.approx(0.0)
+    assert losses["rpa_15"].item() == pytest.approx(0.0)
+    assert losses["rpa_30"].item() == pytest.approx(0.0)
+
+
+def test_pairwise_zero_baseline_masks_direction_but_keeps_magnitude() -> None:
+    extrinsics, intrinsics, image_size = _two_camera_setup()
+    extrinsics[0, 1, :3, 3] = 0.0
+    predicted_extrinsics = extrinsics.clone()
+    predicted_extrinsics[0, 1, 0, 3] = 1.0
+    predicted_pose = build_camera_pose_target(predicted_extrinsics, intrinsics, image_size)
+
+    losses = compute_pairwise_pose_loss(predicted_pose, extrinsics, image_size)
+
+    assert losses["pairwise_translation_direction"].item() == pytest.approx(0.0)
+    assert losses["pairwise_valid_direction_fraction"].item() == pytest.approx(0.0)
+    assert losses["pairwise_translation_magnitude"].item() == pytest.approx(1.0)
+    assert losses["rpa_5"].item() == pytest.approx(0.0)
+
+
+def test_pairwise_pose_loss_rejects_nonfinite_prediction() -> None:
+    extrinsics, intrinsics, image_size = _two_camera_setup()
+    pose = build_camera_pose_target(extrinsics, intrinsics, image_size)
+    pose[0, 1, 0] = float("nan")
+
+    with pytest.raises(ValueError, match="predicted_pose"):
+        compute_pairwise_pose_loss(pose, extrinsics, image_size)
+
+
+def test_camera_depth_loss_adds_explicit_photometric_objective() -> None:
+    height, width = 4, 5
+    images = torch.rand((1, 1, 3, height, width), dtype=torch.float32).repeat(1, 2, 1, 1, 1)
+    depths = torch.ones((1, 2, height, width), dtype=torch.float32)
+    extrinsics = torch.eye(4, dtype=torch.float32)[None, None, :3].repeat(1, 2, 1, 1)
+    intrinsics = torch.tensor(
+        [[[[4.0, 0.0, width / 2], [0.0, 4.0, height / 2], [0.0, 0.0, 1.0]]]],
+        dtype=torch.float32,
+    ).repeat(1, 2, 1, 1)
+    pose = build_camera_pose_target(extrinsics, intrinsics, (height, width))
+    predictions = {"pose_enc": pose, "depth": depths[..., None]}
+    batch = {
+        "images": images,
+        "depths": depths,
+        "depth_masks": torch.ones_like(depths, dtype=torch.bool),
+        "extrinsics": extrinsics,
+        "intrinsics": intrinsics,
+        "normalization_scale_m": torch.ones(1),
+    }
+
+    losses = compute_camera_depth_loss(
+        predictions,
+        batch,
+        photometric_weight=0.25,
+        renderer_options={"backend": "soft", "max_depth_m": 1.2},
+    )
+
+    assert losses["photometric"].item() == pytest.approx(0.0, abs=1e-6)
+    assert losses["photometric_visibility"].item() == pytest.approx(1.0)
+    assert losses["objective"].item() == pytest.approx(0.0, abs=1e-6)

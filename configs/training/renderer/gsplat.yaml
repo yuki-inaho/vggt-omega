@@ -1,0 +1,7 @@
+backend: gsplat
+relative_depth_tolerance: 0.03
+max_depth_m: 1.2
+pose_source: predicted
+use_target_depth: true
+gaussian_radius_pixels: 0.75
+opacity: 0.95

@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 import vggt_omega.training.runner as runner_module
+from vggt_omega.training.losses import build_camera_pose_target
 from vggt_omega.training.model_factory import PreparedTrainingModel
 from vggt_omega.training.runner import (
     _initialize_head_from_checkpoint,
@@ -116,6 +117,41 @@ def test_train_one_epoch_honors_accumulation_and_step_limit() -> None:
 
     assert result.global_step == 5
     assert result.optimizer_steps == 1
+
+
+def test_train_one_epoch_logs_photometric_auxiliary_metrics() -> None:
+    model = _TinyCameraDepthModel()
+    batch = _batch()
+    batch["normalization_scale_m"] = torch.ones(1)
+    with torch.no_grad():
+        model.pose.copy_(
+            build_camera_pose_target(
+                batch["extrinsics"],
+                batch["intrinsics"],
+                (batch["images"].shape[-2], batch["images"].shape[-1]),
+            )[0, 0]
+        )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    logger = _RecordingLogger()
+
+    result = train_one_epoch(
+        model=model,
+        batches=[batch],
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        gradient_clip_norm=1.0,
+        gradient_accumulation_steps=1,
+        min_valid_depth_pixels=1,
+        global_step=0,
+        logger=logger,
+        log_every_steps=1,
+        loss_options={"photometric_weight": 0.01},
+        renderer_options={"backend": "soft", "max_depth_m": 1.2},
+    )
+
+    assert math.isfinite(result.metrics["photometric"])
+    assert logger.records[0][1]["train/photometric"] >= 0
+    assert 0 <= logger.records[0][1]["train/photometric_visibility"] <= 1
 
 
 def test_validate_one_epoch_is_finite_and_does_not_create_gradients() -> None:

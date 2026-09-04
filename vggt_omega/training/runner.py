@@ -59,6 +59,13 @@ _LOSS_WEIGHT_KEYS = (
     "rotation_weight",
     "fov_weight",
 )
+_OPTIONAL_LOSS_DEFAULTS = {
+    "relative_pose_weight": 0.0,
+    "relative_rotation_weight": 1.0,
+    "relative_translation_direction_weight": 1.0,
+    "relative_translation_magnitude_weight": 1.0,
+    "photometric_weight": 0.0,
+}
 _STANDARD_LOSS_CONFIG = {
     "name": "standard",
     "training": {
@@ -89,6 +96,7 @@ _DEFAULT_DEPTH_EVALUATION_THRESHOLDS_M = (0.4, 0.8, 1.2)
 
 def _loss_options(value: Mapping[str, Any]) -> dict[str, float]:
     options = {key: float(value[key]) for key in _LOSS_WEIGHT_KEYS}
+    options.update({key: float(value[key]) for key in _OPTIONAL_LOSS_DEFAULTS if key in value})
     max_metric_depth_m = value.get("max_metric_depth_m")
     if max_metric_depth_m is not None:
         options["max_metric_depth_m"] = float(max_metric_depth_m)
@@ -102,6 +110,22 @@ def _training_loss_options(cfg: DictConfig, epoch: int) -> dict[str, float]:
             break
         selected = stage
     return _loss_options(selected)
+
+
+def _renderer_options(value: Mapping[str, Any]) -> dict[str, object]:
+    options: dict[str, object] = {
+        "backend": str(value["backend"]),
+        "max_depth_m": float(value["max_depth_m"]),
+        "relative_depth_tolerance": float(value["relative_depth_tolerance"]),
+        "pose_source": str(value.get("pose_source", "predicted")),
+        "use_target_depth": bool(value.get("use_target_depth", True)),
+    }
+    if options["backend"] == "soft":
+        options["z_temperature"] = float(value["z_temperature"])
+    elif options["backend"] == "gsplat":
+        options["gaussian_radius_pixels"] = float(value["gaussian_radius_pixels"])
+        options["opacity"] = float(value["opacity"])
+    return options
 
 
 def _metric_improved(value: float, best: float | None, *, mode: str, min_delta: float) -> bool:
@@ -231,6 +255,26 @@ def _training_scalars(
         "train/depth": float(losses["depth"].detach()),
         "train/grad_norm": grad_norm,
     }
+    optional_metrics = {
+        "sample_overlap": "train/sample_overlap",
+        "overlap_target": "train/overlap_target",
+        "overlap_fallback": "train/overlap_fallback",
+        "pairwise_pose": "train/pairwise_pose",
+        "pairwise_rotation": "train/pairwise_rotation",
+        "pairwise_translation_direction": "train/pairwise_translation_direction",
+        "pairwise_translation_magnitude": "train/pairwise_translation_magnitude",
+        "pairwise_valid_direction_fraction": "train/pairwise_valid_direction_fraction",
+        "pairwise_rotation_degrees": "train/pairwise_rotation_degrees",
+        "pairwise_translation_direction_degrees": "train/pairwise_translation_direction_degrees",
+        "rpa_5": "train/rpa_5",
+        "rpa_15": "train/rpa_15",
+        "rpa_30": "train/rpa_30",
+        "photometric": "train/photometric",
+        "photometric_visibility": "train/photometric_visibility",
+    }
+    for metric_name, tag in optional_metrics.items():
+        if metric_name in losses:
+            scalars[tag] = float(losses[metric_name].detach())
     for index, group in enumerate(optimizer.param_groups[:2]):
         scalars[f"optimizer/group_{index}_lr"] = float(group["lr"])
     beta1 = _optimizer_beta1(optimizer)
@@ -408,6 +452,7 @@ def train_one_epoch(
     scheduler: Any = None,
     precision: str = "fp32",
     loss_options: Mapping[str, float] | None = None,
+    renderer_options: Mapping[str, object] | None = None,
 ) -> TrainEpochResult:
     """Train one epoch; ``global_step`` counts optimizer rather than micro steps."""
 
@@ -437,8 +482,21 @@ def train_one_epoch(
                 predictions,
                 batch,
                 min_valid_depth_pixels=min_valid_depth_pixels,
+                renderer_options=renderer_options,
                 **dict(loss_options or {}),
             )
+            losses = dict(losses)
+            sampling_metrics = {
+                "sampling_overlap_score": "sample_overlap",
+                "sampling_overlap_target": "overlap_target",
+                "sampling_overlap_fallback": "overlap_fallback",
+            }
+            for batch_key, metric_name in sampling_metrics.items():
+                if batch_key in batch:
+                    value = batch[batch_key]
+                    if not isinstance(value, torch.Tensor):
+                        raise TypeError(f"{batch_key} must be a tensor")
+                    losses[metric_name] = value.float().mean()
         _ensure_finite_loss(losses)
         (losses["objective"] / gradient_accumulation_steps).backward()
         _accumulate_metrics(totals, losses)
@@ -503,6 +561,7 @@ def validate_one_epoch(
     max_batches: int | None = None,
     precision: str = "fp32",
     loss_options: Mapping[str, float] | None = None,
+    renderer_options: Mapping[str, object] | None = None,
     depth_thresholds_m: Iterable[float] = _DEFAULT_DEPTH_EVALUATION_THRESHOLDS_M,
 ) -> dict[str, float]:
     """Evaluate one epoch using the model weights currently exposed by the optimizer."""
@@ -526,6 +585,7 @@ def validate_one_epoch(
                 predictions,
                 batch,
                 min_valid_depth_pixels=min_valid_depth_pixels,
+                renderer_options=renderer_options,
                 **dict(loss_options or {}),
             )
         _ensure_finite_loss(losses)
@@ -886,9 +946,24 @@ def run_training(
         "max_frames": max_frames,
         "seed": seed,
         "min_valid_depth_pixels": int(cfg.data.min_valid_depth_pixels),
+        "overlap_metric": str(cfg.data.overlap_curriculum.metric),
+        "overlap_start_target": float(cfg.data.overlap_curriculum.start_target),
+        "overlap_end_target": float(cfg.data.overlap_curriculum.end_target),
+        "overlap_target_tolerance": float(cfg.data.overlap_curriculum.target_tolerance),
+        "overlap_curriculum_epochs": int(cfg.data.overlap_curriculum.epochs),
     }
-    train_dataset = ColmapRgbdDataset(data_root, split=train_split, **dataset_options)
-    val_dataset = ColmapRgbdDataset(data_root, split=val_split, **dataset_options)
+    train_dataset = ColmapRgbdDataset(
+        data_root,
+        split=train_split,
+        overlap_curriculum_enabled=bool(cfg.data.overlap_curriculum.enabled),
+        **dataset_options,
+    )
+    val_dataset = ColmapRgbdDataset(
+        data_root,
+        split=val_split,
+        overlap_curriculum_enabled=False,
+        **dataset_options,
+    )
 
     prepared: PreparedTrainingModel = build_training_model(checkpoint_path, device=device)
     model = prepared.model
@@ -1039,6 +1114,7 @@ def run_training(
                 max_optimizer_steps=remaining_steps,
                 precision=str(cfg.model.precision),
                 loss_options=_training_loss_options(cfg, epoch),
+                renderer_options=_renderer_options(cfg.renderer),
             )
             global_step = train_result.global_step
             latest_train = train_result.metrics
@@ -1054,6 +1130,7 @@ def run_training(
                         max_batches=(None if cfg.trainer.max_val_batches is None else int(cfg.trainer.max_val_batches)),
                         precision=str(cfg.model.precision),
                         loss_options=_loss_options(cfg.loss.validation),
+                        renderer_options=_renderer_options(cfg.renderer),
                     )
                     validation_scalars = {f"val/{name}": value for name, value in latest_val.items()}
                     logger.log_scalars(validation_scalars, step=global_step)

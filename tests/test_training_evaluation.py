@@ -71,6 +71,38 @@ def test_validation_loss_options_are_read_from_resolved_config() -> None:
     }
 
 
+def test_pairwise_validation_options_and_monitor_names_are_stable() -> None:
+    config = {
+        "loss": {
+            "validation": {
+                "camera_weight": 5.0,
+                "depth_weight": 1.0,
+                "translation_weight": 1.0,
+                "rotation_weight": 1.0,
+                "fov_weight": 0.5,
+                "relative_pose_weight": 0.1,
+                "relative_rotation_weight": 1.0,
+                "relative_translation_direction_weight": 1.0,
+                "relative_translation_magnitude_weight": 1.0,
+            }
+        }
+    }
+
+    options = _validation_loss_options(config)
+
+    assert options is not None and options["relative_pose_weight"] == pytest.approx(0.1)
+    for metric in (
+        "pairwise_pose",
+        "pairwise_rotation_degrees",
+        "pairwise_translation_direction_degrees",
+        "pairwise_translation_magnitude",
+        "rpa_5",
+        "rpa_15",
+        "rpa_30",
+    ):
+        assert evaluation_module._MONITOR_TO_METRIC[f"val/{metric}"] == metric
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

@@ -68,6 +68,69 @@ def test_near_depth_focus_config_validates() -> None:
     assert cfg.loss.training.depth_weight == pytest.approx(4.0)
 
 
+def test_erayzer_overlap_pairwise_profiles_compose_with_warmup() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_overlap",
+        "model=omega_1b_512_near_head",
+        "loss=erayzer_pairwise_near",
+        "trainer=finetune",
+        "trainer.epochs=4",
+    )
+
+    validate_training_config(cfg)
+
+    assert cfg.data.overlap_curriculum.enabled is True
+    assert cfg.data.overlap_curriculum.metric == "near_depth"
+    assert cfg.data.overlap_curriculum.start_target == pytest.approx(0.24386708438396454)
+    assert [stage.relative_pose_weight for stage in cfg.loss.curriculum] == pytest.approx([0.02, 0.05, 0.1])
+    assert cfg.loss.validation.relative_pose_weight == pytest.approx(0.1)
+
+
+def test_rpa_checkpoint_monitor_requires_max_mode_and_validates() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_overlap",
+        "loss=erayzer_pairwise_near",
+        "trainer=finetune",
+        "trainer.epochs=4",
+        "checkpoint.monitor=val/rpa_15",
+        "checkpoint.mode=max",
+    )
+
+    validate_training_config(cfg)
+
+    assert cfg.checkpoint.monitor == "val/rpa_15"
+    assert cfg.checkpoint.mode == "max"
+
+
+def test_explicit_gsplat_renderer_profile_composes() -> None:
+    cfg = _compose("renderer=gsplat")
+
+    validate_training_config(cfg)
+
+    assert cfg.renderer.backend == "gsplat"
+    assert cfg.renderer.gaussian_radius_pixels == pytest.approx(0.75)
+    assert cfg.renderer.opacity == pytest.approx(0.95)
+
+
+def test_photometric_profile_composes_with_explicit_soft_renderer() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_overlap",
+        "model=omega_1b_512_near_head",
+        "loss=erayzer_photometric_near",
+        "renderer=soft",
+        "trainer=finetune",
+        "trainer.epochs=4",
+    )
+
+    validate_training_config(cfg)
+
+    assert cfg.loss.training.photometric_weight == pytest.approx(0.01)
+    assert cfg.loss.validation.photometric_weight == pytest.approx(0.01)
+    assert cfg.renderer.backend == "soft"
+    assert cfg.renderer.pose_source == "predicted"
+    assert cfg.renderer.use_target_depth is True
+
+
 def test_early_stopping_monitor_must_match_checkpoint_monitor() -> None:
     cfg = _compose("trainer=finetune", "trainer.early_stopping.enabled=true")
     cfg.trainer.early_stopping.monitor = "val/camera_translation"
