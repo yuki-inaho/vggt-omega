@@ -1,6 +1,7 @@
 defaults:
   - data: colmap_rgbd
   - model: omega_1b_512
+  - depth_input: disabled
   - pixel_depth: disabled
   - dynamic_geometry: disabled
   - optimizer: amuse

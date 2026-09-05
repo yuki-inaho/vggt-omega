@@ -432,6 +432,31 @@ def validate_training_config(cfg: DictConfig) -> None:
         raise ValueError("trainer.epochs must be at least 1")
 
     pixel_depth = cfg.pixel_depth
+    depth_input = cfg.depth_input
+    if not isinstance(depth_input.enabled, bool):
+        raise ValueError("depth_input.enabled must be boolean")
+    for owner, value in (
+        ("depth_input.patch_size", depth_input.patch_size),
+        ("depth_input.embed_dim", depth_input.embed_dim),
+    ):
+        if isinstance(value, bool) or int(value) < 1:
+            raise ValueError(f"{owner} must be a positive integer")
+    if isinstance(depth_input.seed_offset, bool) or int(depth_input.seed_offset) < 0:
+        raise ValueError("depth_input.seed_offset must be a non-negative integer")
+    provided_frames = depth_input.validation_provided_frames
+    if isinstance(provided_frames, bool) or int(provided_frames) < 0:
+        raise ValueError("depth_input.validation_provided_frames must be a non-negative integer")
+    if bool(depth_input.enabled):
+        if sequence_frames is None or min_frames != max_frames:
+            raise ValueError("depth_input requires a fixed trainer.sequence_frames contract")
+        if int(provided_frames) > int(sequence_frames):
+            raise ValueError("depth_input.validation_provided_frames must be within the sequence frame range")
+        if int(depth_input.patch_size) != int(cfg.model.patch_size):
+            raise ValueError("depth_input.patch_size must match model.patch_size")
+    if bool(depth_input.enabled) and bool(pixel_depth.enabled):
+        raise ValueError("depth_input and pixel_depth cannot be enabled together")
+    if bool(depth_input.enabled) and bool(cfg.dynamic_geometry.enabled):
+        raise ValueError("depth_input and dynamic_geometry cannot be enabled together")
     if not isinstance(pixel_depth.enabled, bool):
         raise ValueError("pixel_depth.enabled must be boolean")
     for owner, value in (

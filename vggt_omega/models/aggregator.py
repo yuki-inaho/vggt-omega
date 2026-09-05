@@ -99,6 +99,8 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        *,
+        spatial_token_residual: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor | None], int]:
         batch_size, num_frames, num_channels, height, width = images.shape
         if num_channels != 3:
@@ -113,6 +115,21 @@ class Aggregator(nn.Module):
         patch_tokens = self.patch_embed(images)
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
+        if spatial_token_residual is not None:
+            if not isinstance(spatial_token_residual, torch.Tensor):
+                raise ValueError("spatial_token_residual must be a tensor")
+            if spatial_token_residual.shape != patch_tokens.shape:
+                raise ValueError(
+                    "spatial_token_residual shape must exactly match RGB patch tokens: "
+                    f"expected={tuple(patch_tokens.shape)}, actual={tuple(spatial_token_residual.shape)}"
+                )
+            if spatial_token_residual.dtype != patch_tokens.dtype:
+                raise ValueError("spatial_token_residual dtype must exactly match RGB patch tokens")
+            if spatial_token_residual.device != patch_tokens.device:
+                raise ValueError("spatial_token_residual device must exactly match RGB patch tokens")
+            if not torch.isfinite(spatial_token_residual).all():
+                raise ValueError("spatial_token_residual must contain only finite values")
+            patch_tokens = patch_tokens + spatial_token_residual
 
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
         _, num_tokens, embed_dim = tokens.shape

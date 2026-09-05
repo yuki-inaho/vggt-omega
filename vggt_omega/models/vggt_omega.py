@@ -38,6 +38,7 @@ class VGGTOmega(nn.Module):
         images: torch.Tensor,
         *,
         return_patch_features: bool = False,
+        spatial_token_residual: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Predict camera/depth and optionally expose final multi-frame patch features.
 
@@ -55,7 +56,13 @@ class VGGTOmega(nn.Module):
             autocast_context = nullcontext()
 
         with autocast_context:
-            aggregated_tokens_list, patch_token_start = self.aggregator(images)
+            if spatial_token_residual is None:
+                aggregated_tokens_list, patch_token_start = self.aggregator(images)
+            else:
+                aggregated_tokens_list, patch_token_start = self.aggregator(
+                    images,
+                    spatial_token_residual=spatial_token_residual,
+                )
 
         final_tokens = aggregated_tokens_list[-1]
         if final_tokens is None:

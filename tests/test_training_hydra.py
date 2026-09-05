@@ -32,6 +32,7 @@ def test_default_training_config_composes_and_validates() -> None:
     assert cfg.performance.compile.enabled is False
     assert cfg.performance.data_loader.prefetch_factor == 2
     assert cfg.performance.runtime_contracts.first_batch_only is True
+    assert cfg.depth_input.enabled is False
 
 
 def test_profiled_compile_performance_config_composes_and_validates() -> None:
@@ -139,6 +140,52 @@ def test_fixed_four_frame_batch8_profile_composes_and_validates() -> None:
     assert cfg.data.min_frames == 4
     assert cfg.data.max_frames == 4
     assert cfg.data.batch_size == 8
+
+
+def test_640x480_base_only_config_disables_all_optional_wrappers() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_640x480_fixed4",
+        "model=omega_1b_640x480_base",
+        "pixel_depth=disabled",
+        "dynamic_geometry=disabled",
+        "loss=standard",
+        "trainer.sequence_frames=4",
+    )
+
+    validate_training_config(cfg)
+
+    assert cfg.model.name == "omega_1b_640x480_base"
+    assert cfg.model.image_height == 480
+    assert cfg.model.image_width == 640
+    assert cfg.model.patch_size == 16
+    assert cfg.model.precision == "bf16"
+    assert cfg.model.initial_head_checkpoint is None
+    assert cfg.model.freeze_aggregator is True
+    assert cfg.model.freeze_confidence is True
+    assert cfg.pixel_depth.enabled is False
+    assert cfg.dynamic_geometry.enabled is False
+    assert cfg.depth_input.enabled is False
+    assert cfg.loss.name == "standard"
+
+
+def test_640x480_mapped_depth_config_is_opt_in_and_exclusive() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_640x480_fixed4",
+        "model=omega_1b_640x480_base",
+        "depth_input=mapped_depth",
+        "trainer.sequence_frames=4",
+    )
+
+    validate_training_config(cfg)
+
+    assert cfg.depth_input.enabled is True
+    assert cfg.depth_input.patch_size == 16
+    assert cfg.depth_input.embed_dim == 1024
+    assert cfg.depth_input.validation_provided_frames == 4
+
+    cfg.pixel_depth.enabled = True
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        validate_training_config(cfg)
 
 
 def test_guarded_pixel_depth_profile_starts_at_exact_baseline() -> None:

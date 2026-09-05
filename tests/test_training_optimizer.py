@@ -156,6 +156,13 @@ class _TinyOmegaHeads(torch.nn.Module):
         self.dense_head.proj_conf.requires_grad_(False)
 
 
+class _TinyDepthInputOmega(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.adapter = torch.nn.Conv2d(2, 4, kernel_size=2, stride=2)
+        self.base_model = _TinyOmegaHeads()
+
+
 def test_amuse_parameter_groups_are_complete_disjoint_and_terminal_safe() -> None:
     model = _TinyOmegaHeads()
     grouping = classify_amuse_parameters(model)
@@ -172,6 +179,17 @@ def test_amuse_parameter_groups_are_complete_disjoint_and_terminal_safe() -> Non
     assert "dense_head.proj_conf.weight" in grouping.frozen_names
     assert len(grouping.fingerprint) == 64
     assert grouping.fingerprint == classify_amuse_parameters(model).fingerprint
+
+
+def test_depth_input_adapter_and_wrapped_heads_have_complete_optimizer_coverage() -> None:
+    model = _TinyDepthInputOmega()
+
+    grouping = classify_amuse_parameters(model)
+    trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+
+    assert set(grouping.muon_names) | set(grouping.fallback_names) == trainable
+    assert any(name.startswith("adapter.") for name in grouping.muon_names)
+    assert "base_model.dense_head.proj_conf.weight" in grouping.frozen_names
 
 
 @pytest.mark.parametrize(

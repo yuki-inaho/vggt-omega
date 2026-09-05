@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from vggt_omega.models import VGGTOmega
+from vggt_omega.training.depth_input_model import DepthInputTrainingModel, MappedDepthTokenAdapter
 from vggt_omega.training.dynamic_model import DynamicGeometryTrainingModel
 from vggt_omega.training.pixel_depth_model import PixelPerfectDepthTrainingModel
 from vggt_omega.utils.load_fn import load_checkpoint_state_dict
@@ -126,6 +127,38 @@ def attach_pixel_depth_model(
     ]
     if missing_groups:
         raise RuntimeError(f"pixel-depth trainable state is missing groups: {missing_groups}")
+    return PreparedTrainingModel(model=model, trainable_parameter_names=trainable_names)
+
+
+def attach_depth_input_model(
+    prepared: PreparedTrainingModel,
+    config: Mapping[str, object],
+    *,
+    device: torch.device | str | None = None,
+) -> PreparedTrainingModel:
+    """Attach the opt-in mapped-depth adapter after strict base initialization."""
+
+    if not bool(config.get("enabled", False)):
+        return prepared
+    adapter = MappedDepthTokenAdapter(
+        patch_size=int(config["patch_size"]),
+        embed_dim=int(config["embed_dim"]),
+    )
+    model = DepthInputTrainingModel(prepared.model, adapter)
+    if device is not None:
+        model = model.to(device)
+    model.train()
+    model.aggregator.requires_grad_(False)
+    model.aggregator.eval()
+    trainable_names = tuple(name for name, parameter in model.named_parameters() if parameter.requires_grad)
+    invalid = [
+        name
+        for name in trainable_names
+        if not name.startswith(("adapter.", "base_model.camera_head.", "base_model.dense_head."))
+        or name.startswith("base_model.dense_head.proj_conf.")
+    ]
+    if invalid or not any(name.startswith("adapter.") for name in trainable_names):
+        raise RuntimeError(f"depth-input trainable parameter contract is invalid: {invalid}")
     return PreparedTrainingModel(model=model, trainable_parameter_names=trainable_names)
 
 

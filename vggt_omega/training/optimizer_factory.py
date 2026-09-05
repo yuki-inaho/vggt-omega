@@ -21,6 +21,7 @@ _TERMINAL_PARAMETER_SUFFIXES = (
     "correspondence_head.output_projection.weight",
 )
 _TRAINABLE_PREFIXES = (
+    "adapter.",
     "camera_head.",
     "dense_head.",
     "base_model.camera_head.",

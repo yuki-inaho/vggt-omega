@@ -27,9 +27,11 @@ from vggt_omega.training.checkpointing import (
 )
 from vggt_omega.training.config import validate_training_config
 from vggt_omega.training.dataset import ColmapRgbdDataset
-from vggt_omega.training.losses import compute_camera_depth_loss
+from vggt_omega.training.depth_input_model import fixed_depth_availability, sample_depth_availability
+from vggt_omega.training.losses import compute_camera_depth_loss, compute_depth_loss
 from vggt_omega.training.model_factory import (
     PreparedTrainingModel,
+    attach_depth_input_model,
     attach_dynamic_geometry_model,
     attach_pixel_depth_model,
     build_training_model,
@@ -506,6 +508,7 @@ def train_one_epoch(
     renderer_options: Mapping[str, object] | None = None,
     pixel_depth_options: Mapping[str, object] | None = None,
     dynamic_geometry_options: Mapping[str, object] | None = None,
+    depth_input_options: Mapping[str, object] | None = None,
     flow_generator: torch.Generator | None = None,
     performance_options: Mapping[str, object] | None = None,
 ) -> TrainEpochResult:
@@ -551,7 +554,23 @@ def train_one_epoch(
         ):
             validate_training_batch_contract(batch)
         with _autocast_context(device, precision):
-            if dynamic_geometry_options is not None:
+            if depth_input_options is not None:
+                mapped_depth, valid_mask = _depth_input_batch(batch)
+                availability = sample_depth_availability(
+                    int(images.shape[0]),
+                    int(images.shape[1]),
+                    seed=cast(int, depth_input_options["seed"]),
+                    epoch=cast(int, depth_input_options["epoch"]),
+                    optimizer_step=global_step,
+                    device=device,
+                )
+                predictions = model(
+                    images,
+                    mapped_depth=mapped_depth,
+                    valid_mask=valid_mask,
+                    availability=availability,
+                )
+            elif dynamic_geometry_options is not None:
                 dynamic_forward = getattr(model, "forward_dynamic", None)
                 if not callable(dynamic_forward):
                     raise ValueError("dynamic geometry training requires its wrapper")
@@ -713,6 +732,7 @@ def validate_one_epoch(
     depth_thresholds_m: Iterable[float] = _DEFAULT_DEPTH_EVALUATION_THRESHOLDS_M,
     pixel_depth_options: Mapping[str, object] | None = None,
     dynamic_geometry_options: Mapping[str, object] | None = None,
+    depth_input_options: Mapping[str, object] | None = None,
     flow_generator: torch.Generator | None = None,
     performance_options: Mapping[str, object] | None = None,
 ) -> dict[str, float]:
@@ -740,7 +760,24 @@ def validate_one_epoch(
         ):
             validate_training_batch_contract(batch)
         with _autocast_context(device, precision):
-            if dynamic_geometry_options is not None:
+            if depth_input_options is not None:
+                images = batch.get("images")
+                if not isinstance(images, torch.Tensor):
+                    raise ValueError("depth-input validation requires images")
+                mapped_depth, valid_mask = _depth_input_batch(batch)
+                availability = fixed_depth_availability(
+                    int(images.shape[0]),
+                    int(images.shape[1]),
+                    cast(int, depth_input_options["validation_provided_frames"]),
+                    device=device,
+                )
+                predictions = model(
+                    images,
+                    mapped_depth=mapped_depth,
+                    valid_mask=valid_mask,
+                    availability=availability,
+                )
+            elif dynamic_geometry_options is not None:
                 dynamic_forward = getattr(model, "forward_dynamic", None)
                 if not callable(dynamic_forward):
                     raise ValueError("dynamic geometry validation requires its wrapper")
@@ -775,6 +812,16 @@ def validate_one_epoch(
                 renderer_options=renderer_options,
                 **dict(loss_options or {}),
             )
+            if depth_input_options is not None:
+                losses = {
+                    **losses,
+                    **_depth_input_validation_metrics(
+                        predictions,
+                        batch,
+                        availability,
+                        min_valid_depth_pixels=min_valid_depth_pixels,
+                    ),
+                }
             if pixel_depth_options is not None:
                 pixel_metrics = {
                     **losses,
@@ -995,6 +1042,55 @@ def _pixel_depth_config(cfg: DictConfig) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         raise TypeError("resolved pixel_depth configuration must be a dictionary")
     return cast(dict[str, Any], value)
+
+
+def _depth_input_config(cfg: DictConfig) -> dict[str, Any] | None:
+    if not bool(cfg.depth_input.enabled):
+        return None
+    value = OmegaConf.to_container(cfg.depth_input, resolve=True)
+    if not isinstance(value, dict):
+        raise TypeError("resolved depth_input configuration must be a dictionary")
+    return cast(dict[str, Any], value)
+
+
+def _depth_input_batch(batch: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+    depths = batch.get("depths")
+    masks = batch.get("depth_masks")
+    if not isinstance(depths, torch.Tensor) or depths.ndim != 4:
+        raise ValueError("depth-input training requires depths with shape [B,S,H,W]")
+    if not isinstance(masks, torch.Tensor) or masks.shape != depths.shape or masks.dtype != torch.bool:
+        raise ValueError("depth-input training requires bool depth_masks matching depths")
+    return depths.unsqueeze(2), masks.unsqueeze(2)
+
+
+def _depth_input_validation_metrics(
+    predictions: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    availability: torch.Tensor,
+    *,
+    min_valid_depth_pixels: int,
+) -> dict[str, torch.Tensor]:
+    predicted = predictions.get("depth")
+    target = batch.get("depths")
+    valid = batch.get("depth_masks")
+    if not isinstance(predicted, torch.Tensor) or not isinstance(target, torch.Tensor):
+        raise ValueError("depth-input validation requires predicted and target depth")
+    if not isinstance(valid, torch.Tensor) or valid.shape != target.shape:
+        raise ValueError("depth-input validation requires matching depth_masks")
+    if availability.shape != target.shape[:2]:
+        raise ValueError("depth-input availability must match target [B,S]")
+    provided = availability[:, :, None, None]
+    dtype = predicted.dtype
+    return {
+        "depth_provided": compute_depth_loss(
+            predicted, target, valid & provided, min_valid_pixels=min_valid_depth_pixels
+        ),
+        "depth_unprovided": compute_depth_loss(
+            predicted, target, valid & ~provided, min_valid_pixels=min_valid_depth_pixels
+        ),
+        "provided_frame_count": availability.sum(dim=1).to(dtype=dtype).mean(),
+        "unprovided_frame_count": (~availability).sum(dim=1).to(dtype=dtype).mean(),
+    }
 
 
 def _performance_config(cfg: DictConfig) -> dict[str, Any]:
@@ -1955,6 +2051,7 @@ def run_training(
 
     min_frames, max_frames = _dataset_frame_range(cfg)
     dynamic_config = _dynamic_geometry_config(cfg)
+    depth_input_config = _depth_input_config(cfg)
     is_smoke = str(cfg.trainer.name) == "smoke"
     train_split = str(cfg.data.smoke_split if is_smoke else cfg.data.train_split)
     val_split = str(cfg.data.smoke_split if is_smoke else cfg.data.val_split)
@@ -1999,6 +2096,9 @@ def run_training(
             trainable_parameter_names=prepared.trainable_parameter_names,
             expected_base_checkpoint=base_metadata["base_checkpoint"],
         )
+    if depth_input_config is not None:
+        prepared = attach_depth_input_model(prepared, depth_input_config, device=device)
+        model = prepared.model
     pixel_config = _pixel_depth_config(cfg)
     pixel_runtime_options = _pixel_depth_runtime_options(pixel_config)
     if pixel_config is not None:
@@ -2170,6 +2270,15 @@ def run_training(
                     break
             pixel_runtime_options = _pixel_depth_runtime_options(pixel_config, epoch=epoch)
             dynamic_runtime_options = _dynamic_geometry_runtime_options(dynamic_config, epoch=epoch)
+            depth_input_runtime_options = (
+                None
+                if depth_input_config is None
+                else {
+                    **depth_input_config,
+                    "seed": seed + int(depth_input_config["seed_offset"]),
+                    "epoch": epoch,
+                }
+            )
             train_enabled = (
                 True
                 if pixel_runtime_options is None and dynamic_runtime_options is None
@@ -2207,6 +2316,7 @@ def run_training(
                     renderer_options=_renderer_options(cfg.renderer),
                     pixel_depth_options=pixel_runtime_options,
                     dynamic_geometry_options=dynamic_runtime_options,
+                    depth_input_options=depth_input_runtime_options,
                     flow_generator=flow_generator,
                     performance_options=performance_config,
                 )
@@ -2251,6 +2361,7 @@ def run_training(
                         renderer_options=_renderer_options(cfg.renderer),
                         pixel_depth_options=pixel_runtime_options,
                         dynamic_geometry_options=dynamic_runtime_options,
+                        depth_input_options=depth_input_runtime_options,
                         flow_generator=(
                             None
                             if pixel_config is None

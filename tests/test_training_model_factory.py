@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from vggt_omega.training.model_factory import build_training_model, set_training_mode
+from vggt_omega.training.model_factory import attach_depth_input_model, build_training_model, set_training_mode
 
 
 class _TinyDenseHead(nn.Module):
@@ -113,3 +113,18 @@ def test_build_training_model_rejects_nonfinite_attention_bias_mask(tmp_path: Pa
 
     with pytest.raises(ValueError, match="non-finite attention bias mask"):
         build_training_model(checkpoint, model_builder=_TinyOmega)
+
+
+def test_attach_depth_input_model_classifies_only_adapter_and_base_heads(tmp_path: Path) -> None:
+    prepared = build_training_model(_write_checkpoint(tmp_path / "model.pt"), model_builder=_TinyOmega)
+
+    wrapped = attach_depth_input_model(prepared, {"enabled": True, "patch_size": 2, "embed_dim": 4})
+
+    assert wrapped.trainable_parameter_names
+    assert any(name.startswith("adapter.") for name in wrapped.trainable_parameter_names)
+    assert all(
+        name.startswith(("adapter.", "base_model.camera_head.", "base_model.dense_head."))
+        and not name.startswith("base_model.dense_head.proj_conf.")
+        for name in wrapped.trainable_parameter_names
+    )
+    assert all(not parameter.requires_grad for parameter in wrapped.model.aggregator.parameters())

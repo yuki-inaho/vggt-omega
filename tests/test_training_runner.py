@@ -245,11 +245,31 @@ class _TinyCameraDepthModel(torch.nn.Module):
         self.pose = torch.nn.Parameter(torch.zeros(9))
         self.log_depth = torch.nn.Parameter(torch.tensor(0.25))
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, images: torch.Tensor, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        del inputs
         batch, frames, _, height, width = images.shape
         pose = self.pose.view(1, 1, 9).expand(batch, frames, -1)
         depth = self.log_depth.exp().expand(batch, frames, height, width, 1)
         return {"pose_enc": pose, "depth": depth}
+
+
+class _TinyDepthInputModel(_TinyCameraDepthModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.availability: list[torch.Tensor] = []
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        **inputs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        mapped_depth = inputs["mapped_depth"]
+        valid_mask = inputs["valid_mask"]
+        availability = inputs["availability"]
+        assert mapped_depth.shape == (*images.shape[:2], 1, *images.shape[-2:])
+        assert valid_mask.shape == mapped_depth.shape
+        self.availability.append(availability.detach().clone())
+        return super().forward(images)
 
 
 class _RecordingLogger:
@@ -308,6 +328,59 @@ def test_train_one_epoch_updates_model_logs_scalars_and_clips_gradients() -> Non
     assert [step for step, _ in logger.records] == [1, 2]
     assert all("train/objective" in scalars for _, scalars in logger.records)
     assert all("train/grad_norm" in scalars for _, scalars in logger.records)
+
+
+def test_train_and_validation_route_depth_input_with_seeded_and_fixed_availability() -> None:
+    model = _TinyDepthInputModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    options = {"seed": 42, "epoch": 3, "validation_provided_frames": 1}
+
+    result = train_one_epoch(
+        model=model,
+        batches=[_batch()],
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        gradient_clip_norm=1.0,
+        gradient_accumulation_steps=1,
+        min_valid_depth_pixels=1,
+        global_step=7,
+        logger=None,
+        log_every_steps=1,
+        depth_input_options=options,
+    )
+    metrics = validate_one_epoch(
+        model=model,
+        batches=[_batch()],
+        device=torch.device("cpu"),
+        min_valid_depth_pixels=1,
+        depth_input_options=options,
+    )
+
+    assert result.global_step == 8
+    assert math.isfinite(metrics["objective"])
+    assert metrics["provided_frame_count"] == pytest.approx(1.0)
+    assert metrics["unprovided_frame_count"] == pytest.approx(1.0)
+    assert math.isfinite(metrics["depth_provided"])
+    assert math.isfinite(metrics["depth_unprovided"])
+    assert len(model.availability) == 2
+    assert model.availability[1].sum().item() == 1
+
+
+def test_depth_input_frame_counts_are_per_sample_means() -> None:
+    model = _TinyDepthInputModel()
+    batch = _batch()
+    doubled = {key: value.repeat((2, *([1] * (value.ndim - 1)))) for key, value in batch.items()}
+
+    metrics = validate_one_epoch(
+        model=model,
+        batches=[doubled, batch],
+        device=torch.device("cpu"),
+        min_valid_depth_pixels=1,
+        depth_input_options={"validation_provided_frames": 1},
+    )
+
+    assert metrics["provided_frame_count"] == pytest.approx(1.0)
+    assert metrics["unprovided_frame_count"] == pytest.approx(1.0)
 
 
 def test_train_one_epoch_reports_profiled_throughput_and_checks_first_batch_contract() -> None:
