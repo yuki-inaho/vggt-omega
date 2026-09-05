@@ -14,8 +14,8 @@ dependencies = [
     "einops",
     "safetensors",
     "opencv-python",
-    "torch>=2.3",
-    "torchvision>=0.18",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
 ]
 
 [project.scripts]
@@ -122,6 +122,15 @@ markers = [
     "rgbd_smoke: requires CUDA, a VGGT-Omega checkpoint, and a standardized RGB-D session",
     "slow: long-running",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [tool.ty.rules]
 # ty is preview-stage and pytorch dynamic attribute access is hard to model:
