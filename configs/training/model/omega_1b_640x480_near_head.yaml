@@ -1,0 +1,9 @@
+name: omega_1b_640x480
+pretrained_checkpoint: checkpoints/vggt_omega_1b_512.pt
+initial_head_checkpoint: checkpoints/accepted_near_depth_best.pt
+image_height: 480
+image_width: 640
+patch_size: 16
+precision: bf16
+freeze_aggregator: true
+freeze_confidence: true

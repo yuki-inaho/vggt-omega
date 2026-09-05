@@ -1,0 +1,6 @@
+defaults:
+  - pixel_perfect_gpa_correspondence
+  - _self_
+
+# Resolution-independent curriculum alias. The paired model/data groups enforce
+# the real H=480, W=640 input contract while keeping one canonical loss recipe.
