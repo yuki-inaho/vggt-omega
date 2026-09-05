@@ -87,6 +87,10 @@ demo *ARGS:
 demo-text *ARGS:
     {{uv}} python demo_gradio.py --checkpoint {{ckpt_256}} --image-resolution 256 --enable-alignment {{ARGS}}
 
+# Browse paired RGB, mapped depth, and valid masks without a checkpoint or GPU.
+rgbd-viewer root="/workspace/data/vggt_omega/colmap_rgbd_640x480_v1" *ARGS:
+    {{uv}} python demo_rgbd_gradio.py --dataset-root "{{root}}" {{ARGS}}
+
 # Quick CLI smoke test: extract frames from an example video and run inference.
 smoke ckpt=ckpt_512 video="examples/forest_road.mp4" frames="4":
     {{uv}} python -m vggt_omega.cli smoke --checkpoint {{ckpt}} --video {{video}} --num-frames {{frames}}

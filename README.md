@@ -130,6 +130,48 @@ provided RGB-D configuration), while a base-only model retains the original
 `--preprocess-mode fixed --target-height 384 --target-width 512`. A `.zst`
 checkpoint must be decompressed before loading.
 
+### RGB-D input viewer
+
+Use the checkpoint-free Gradio viewer to inspect the RGB, mapped depth, valid
+mask, and RGB-depth overlay that will be presented to the RGB-D input adapter:
+
+```bash
+just rgbd-viewer
+```
+
+The default root is
+`/workspace/data/vggt_omega/colmap_rgbd_640x480_v1`. The viewer indexes
+`scenes/*/rgb`, pairs each RGB with the same-name files in sibling `depth` and
+`valid_mask` directories, and shows up to 64 selected frames with metric-depth
+statistics. Selecting dataset-relative paths is unambiguous. Uploaded RGB
+copies are matched by basename and, only when that basename occurs in multiple
+scenes, by file digest; an unresolved ambiguity is reported instead of choosing
+a frame silently. Dropped uploads take precedence over any dropdown selection
+and render automatically, so hidden initial selections are never mixed in.
+Source files are read-only and neither a checkpoint nor CUDA is required.
+
+The loader is reusable without Gradio through
+`vggt_omega.rgbd_viewer.RgbdDatasetIndex`, `RgbdLoaderConfig`, and
+`load_rgbd_frame`. Directory names, filename key suffixes, the stored-depth to
+meter scale, strict mask validation, and explicit `depth > 0` mask derivation
+are configurable. For example, a generic layout with
+`images/shot_rgb.png` and `mapped_depth/shot_depth.png` can be opened with:
+
+```bash
+uv run --extra demo python demo_rgbd_gradio.py \
+  --dataset-root /path/to/dataset \
+  --rgb-directory images \
+  --depth-directory mapped_depth \
+  --mask-directory '' \
+  --rgb-key-suffix _rgb \
+  --depth-key-suffix _depth \
+  --derive-mask-when-missing \
+  --depth-scale-to-m 0.001
+```
+
+Run `uv run --extra demo python demo_rgbd_gradio.py --help` for server and
+layout options.
+
 ### Camera-motion curriculum fine-tuning
 
 To initialize the trainable camera/depth heads from a completed `last.pt`
