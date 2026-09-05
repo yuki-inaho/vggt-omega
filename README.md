@@ -217,8 +217,17 @@ bridge only: VGGT-Omega neither installs nor invokes COLMAP.
 
 ## License
 
-See the [LICENSE](./LICENSE) file for details about the license under which
-this code is made available.
+This is a mixed-license repository:
+
+- upstream VGGT-Omega code and derivative modifications remain under the
+  [FAIR Noncommercial Research License](./LICENSE);
+- separable fork additions listed in [LICENSES.md](./LICENSES.md) are offered
+  under the [Apache License 2.0](./LICENSE-APACHE-2.0); and
+- vendored third-party code retains its own license and provenance notices.
+
+Apache-2.0 coverage of a fork addition does not relicense the upstream model,
+upstream code, derivative files, model weights, or their outputs. See
+[LICENSES.md](./LICENSES.md) for the authoritative path-level scope.
 
 [^release]: This Release is intended to support the open source research community.
 
