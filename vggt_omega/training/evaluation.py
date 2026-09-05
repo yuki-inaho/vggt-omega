@@ -9,6 +9,7 @@ import math
 import os
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -18,14 +19,26 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from vggt_omega.training.dataset import ColmapRgbdDataset
+from vggt_omega.training.depth_input_evaluation import (
+    DepthSufficientStatistics,
+    all_depth_availability_cases,
+    build_input_depth_holdout,
+    depth_sufficient_statistics,
+    merge_depth_statistics,
+    metric_result,
+)
+from vggt_omega.training.losses import compute_camera_loss, compute_pairwise_pose_loss
 from vggt_omega.training.model_factory import (
     PreparedTrainingModel,
+    attach_depth_input_model,
     attach_dynamic_geometry_model,
     attach_pixel_depth_model,
     build_training_model,
 )
 from vggt_omega.training.runner import (
+    _autocast_context,
     _dynamic_geometry_runtime_options,
+    _move_batch,
     _renderer_options,
     validate_one_epoch,
 )
@@ -653,6 +666,10 @@ def evaluate_training_checkpoints(
     device: str | torch.device = "cuda",
     tolerance: float = 1e-4,
     depth_thresholds_m: Iterable[float] = (0.4, 0.8, 1.2),
+    checkpoint_limit: int | None = None,
+    depth_provided_frames: int | None = None,
+    validate_stored_monitor: bool = True,
+    evaluation_batch_size: int | None = None,
     model_factory: ModelFactory | None = None,
     dataset_factory: DatasetFactory | None = None,
     validator: Validator | None = None,
@@ -669,6 +686,18 @@ def evaluate_training_checkpoints(
     tolerance_value = float(tolerance)
     if not math.isfinite(tolerance_value) or tolerance_value < 0:
         raise ValueError("tolerance must be a finite non-negative number")
+    if checkpoint_limit is not None and (
+        isinstance(checkpoint_limit, bool) or not isinstance(checkpoint_limit, int) or checkpoint_limit < 1
+    ):
+        raise ValueError("checkpoint_limit must be None or a positive integer")
+    if not isinstance(validate_stored_monitor, bool):
+        raise ValueError("validate_stored_monitor must be boolean")
+    if evaluation_batch_size is not None and (
+        isinstance(evaluation_batch_size, bool)
+        or not isinstance(evaluation_batch_size, int)
+        or evaluation_batch_size < 1
+    ):
+        raise ValueError("evaluation_batch_size must be None or a positive integer")
     thresholds_m: list[float] = []
     for value in depth_thresholds_m:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -688,6 +717,23 @@ def evaluate_training_checkpoints(
     if cwd.is_symlink() or not cwd.is_dir():
         raise EvaluationError("original cwd must be a regular directory")
     resolved_config = _read_json_object(run_root / "resolved_config.json", "resolved_config.json")
+    configured_depth_input = resolved_config.get("depth_input")
+    evaluation_depth_input: Mapping[str, object] | None = None
+    if isinstance(configured_depth_input, Mapping) and configured_depth_input.get("enabled") is True:
+        evaluation_depth_input = cast(Mapping[str, object], configured_depth_input)
+    if depth_provided_frames is not None:
+        if evaluation_depth_input is None:
+            raise EvaluationError("depth_provided_frames requires an enabled depth_input config")
+        sequence_frames = _positive_int(
+            _mapping(resolved_config, "trainer").get("sequence_frames"), "trainer.sequence_frames"
+        )
+        if (
+            isinstance(depth_provided_frames, bool)
+            or not isinstance(depth_provided_frames, int)
+            or not 0 <= depth_provided_frames <= sequence_frames
+        ):
+            raise ValueError("depth_provided_frames must be within the sequence frame range")
+        evaluation_depth_input = {**evaluation_depth_input, "validation_provided_frames": depth_provided_frames}
     summary = _read_json_object(run_root / "run_summary.json", "run_summary.json")
     model_config = _mapping(resolved_config, "model")
     if model_config.get("precision") != "bf16":
@@ -760,6 +806,8 @@ def evaluate_training_checkpoints(
         completed_epochs=completed_epochs,
         final_step=final_step,
     )
+    if checkpoint_limit is not None:
+        entries = entries[:checkpoint_limit]
 
     runtime_device = torch.device(device)
     if runtime_device.type not in {"cpu", "cuda"}:
@@ -795,6 +843,8 @@ def evaluate_training_checkpoints(
 
     selected_dataset_factory = dataset_factory or ColmapRgbdDataset
     dataset, validation_options = _validation_dataset(resolved_config, cwd, selected_dataset_factory)
+    if evaluation_batch_size is not None:
+        validation_options = {**validation_options, "batch_size": evaluation_batch_size}
     validation_loss_options = _validation_loss_options(resolved_config)
     renderer_config = resolved_config.get("renderer")
     validation_renderer_options = (
@@ -854,6 +904,7 @@ def evaluate_training_checkpoints(
                     and cast(Mapping[str, Any], resolved_config["dynamic_geometry"]).get("enabled") is True
                     else None
                 ),
+                depth_input_options=evaluation_depth_input,
                 flow_generator=(
                     torch.Generator(device=runtime_device).manual_seed(
                         seed + int(cast(Mapping[str, object], pixel_config["flow"])["seed_offset"]) + 1
@@ -866,7 +917,7 @@ def evaluate_training_checkpoints(
         if metric_key not in metrics:
             raise EvaluationError(f"recomputed validation metrics are missing {metric_key}")
         metric_error = abs(metrics[metric_key] - float(entry["metric"]))
-        if metric_error > tolerance_value:
+        if validate_stored_monitor and metric_error > tolerance_value:
             raise EvaluationError("recomputed validation monitor exceeds the configured tolerance")
         checkpoint_reports.append(
             {
@@ -887,6 +938,7 @@ def evaluate_training_checkpoints(
         "group_fingerprint": group_fingerprint,
         "initial_head_checkpoint": initial_head_metadata,
         "monitor": monitor,
+        "stored_monitor_validated": validate_stored_monitor,
         "status": "passed",
         "tolerance": tolerance_value,
         "validation": {
@@ -896,10 +948,655 @@ def evaluate_training_checkpoints(
             "precision": "bf16",
             "sample_count": len(dataset),
             "split": validation_options["split"],
+            "depth_provided_frames": depth_provided_frames,
         },
     }
     _atomic_json(report, Path(output_path).expanduser().resolve())
     return report
+
+
+@dataclass(frozen=True)
+class _ScalarStatistics:
+    total: float = 0.0
+    count: int = 0
+
+    @property
+    def mean(self) -> float | None:
+        if self.count == 0:
+            return None
+        return self.total / self.count
+
+
+@dataclass(frozen=True)
+class _PairedSnapshot:
+    identity_digest: str
+    sample_count: int
+    cases: dict[str, dict[str, DepthSufficientStatistics]]
+    pose: dict[str, _ScalarStatistics]
+    holdout: DepthSufficientStatistics | None
+    holdout_error: str | None
+
+
+class _BaselinePairedCollector:
+    def __init__(self) -> None:
+        self.snapshot: _PairedSnapshot | None = None
+
+    def __call__(self, **kwargs: Any) -> dict[str, float]:
+        if self.snapshot is not None:
+            raise EvaluationError("paired baseline collector must run exactly once")
+        self.snapshot = _collect_paired_snapshot(conditioned=False, **kwargs)
+        return {"camera": 0.0, "depth": 0.0, "objective": 0.0}
+
+
+class _CandidatePairedCollector:
+    def __init__(self) -> None:
+        self.snapshots: list[_PairedSnapshot] = []
+
+    def __call__(self, **kwargs: Any) -> dict[str, float]:
+        self.snapshots.append(_collect_paired_snapshot(conditioned=True, **kwargs))
+        return {"camera": 0.0, "depth": 0.0, "objective": 0.0}
+
+
+def evaluate_rgbd_conditioning(
+    base_run_dir: str | os.PathLike[str],
+    candidate_run_dir: str | os.PathLike[str],
+    *,
+    output_path: str | os.PathLike[str],
+    original_cwd: str | os.PathLike[str],
+    device: str | torch.device = "cuda",
+    tolerance: float = 1e-4,
+    checkpoint_limit: int = 3,
+    evaluation_batch_size: int = 2,
+    checkpoint_evaluator: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Compare RGB-only and RGB-D checkpoints on identical pixels and frame subsets."""
+
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise ValueError("tolerance must be a finite non-negative number")
+    tolerance_value = float(tolerance)
+    if not math.isfinite(tolerance_value) or tolerance_value < 0:
+        raise ValueError("tolerance must be a finite non-negative number")
+    if isinstance(checkpoint_limit, bool) or not isinstance(checkpoint_limit, int) or checkpoint_limit < 1:
+        raise ValueError("checkpoint_limit must be a positive integer")
+    if (
+        isinstance(evaluation_batch_size, bool)
+        or not isinstance(evaluation_batch_size, int)
+        or evaluation_batch_size < 1
+    ):
+        raise ValueError("evaluation_batch_size must be a positive integer")
+
+    base_root = Path(base_run_dir).expanduser().resolve()
+    candidate_root = Path(candidate_run_dir).expanduser().resolve()
+    cwd = Path(original_cwd).expanduser().resolve()
+    destination = Path(output_path).expanduser().resolve()
+    if base_root == candidate_root:
+        raise EvaluationError("paired baseline and candidate run directories must differ")
+    for root, name in ((base_root, "baseline"), (candidate_root, "candidate")):
+        if root.is_symlink() or not root.is_dir():
+            raise EvaluationError(f"paired {name} run directory must be a regular directory")
+    if destination.exists() or destination.is_symlink():
+        raise EvaluationError("paired output path must not already exist")
+    base_config = _read_json_object(base_root / "resolved_config.json", "baseline resolved_config.json")
+    candidate_config = _read_json_object(candidate_root / "resolved_config.json", "candidate resolved_config.json")
+    _validate_paired_run_configs(base_config, candidate_config)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    selected_evaluator = checkpoint_evaluator or evaluate_training_checkpoints
+    baseline_collector = _BaselinePairedCollector()
+    candidate_collector = _CandidatePairedCollector()
+    with tempfile.TemporaryDirectory(prefix=".rgbd-paired-", dir=destination.parent) as temporary_name:
+        temporary = Path(temporary_name)
+        baseline_validation = selected_evaluator(
+            base_root,
+            output_path=temporary / "baseline.json",
+            original_cwd=cwd,
+            device=device,
+            tolerance=tolerance_value,
+            checkpoint_limit=1,
+            validate_stored_monitor=False,
+            evaluation_batch_size=evaluation_batch_size,
+            validator=baseline_collector,
+        )
+        candidate_validation = selected_evaluator(
+            candidate_root,
+            output_path=temporary / "candidate.json",
+            original_cwd=cwd,
+            device=device,
+            tolerance=tolerance_value,
+            checkpoint_limit=checkpoint_limit,
+            validate_stored_monitor=False,
+            evaluation_batch_size=evaluation_batch_size,
+            validator=candidate_collector,
+        )
+
+    if baseline_collector.snapshot is None:
+        raise EvaluationError("paired baseline evaluation produced no snapshot")
+    baseline_snapshot = baseline_collector.snapshot
+    candidate_checkpoints = candidate_validation.get("checkpoints")
+    baseline_checkpoints = baseline_validation.get("checkpoints")
+    if not isinstance(baseline_checkpoints, list) or len(baseline_checkpoints) != 1:
+        raise EvaluationError("paired baseline evaluation must produce exactly one checkpoint")
+    if not isinstance(candidate_checkpoints, list) or not candidate_checkpoints:
+        raise EvaluationError("paired candidate evaluation must produce checkpoints")
+    if len(candidate_checkpoints) != len(candidate_collector.snapshots):
+        raise EvaluationError("paired candidate checkpoint and snapshot counts differ")
+    if baseline_validation.get("base_checkpoint") != candidate_validation.get("base_checkpoint"):
+        raise EvaluationError("paired runs do not use the same strict base checkpoint")
+    baseline_checkpoint = baseline_checkpoints[0]
+    if not isinstance(baseline_checkpoint, Mapping):
+        raise EvaluationError("paired baseline checkpoint report is invalid")
+    initial_head = candidate_validation.get("initial_head_checkpoint")
+    if (
+        not isinstance(initial_head, Mapping)
+        or initial_head.get("sha256") != baseline_checkpoint.get("sha256")
+        or initial_head.get("filename") != baseline_checkpoint.get("filename")
+    ):
+        raise EvaluationError("candidate initial head is not the paired baseline checkpoint")
+    for snapshot in candidate_collector.snapshots:
+        if (
+            snapshot.identity_digest != baseline_snapshot.identity_digest
+            or snapshot.sample_count != baseline_snapshot.sample_count
+        ):
+            raise EvaluationError("paired validation sample identities or ordering differ")
+
+    candidate_reports = [
+        _candidate_comparison_report(baseline_snapshot, snapshot, checkpoint)
+        for snapshot, checkpoint in zip(candidate_collector.snapshots, candidate_checkpoints, strict=True)
+    ]
+    selection = _select_paired_candidate(candidate_reports, tolerance_value)
+    selected_index = int(selection["candidate_index"])
+    selected = candidate_reports[selected_index]
+    guardrails = _paired_guardrails(selected)
+    partial_passes = [
+        _required_improvement(selected["comparisons"][f"V{k}"]["normalized_mae"], tolerance_value) for k in (1, 2, 3)
+    ]
+    paired_gate_passed = all(partial_passes) and all(
+        item["passed"] for item in cast(Mapping[str, Mapping[str, Any]], guardrails["metrics"]).values()
+    )
+    report = {
+        "base_checkpoint": {
+            key: baseline_checkpoint[key]
+            for key in ("epoch", "filename", "global_step", "sha256")
+            if key in baseline_checkpoint
+        },
+        "candidates": candidate_reports,
+        "edge_multiview": {
+            "edge_3d_error_proxy": None,
+            "multiview_depth_error": None,
+            "reason": "not_measured_by_rgbd_paired_v1",
+        },
+        "format_version": 2,
+        "full_training_started": False,
+        "guardrails": guardrails,
+        "paired_gate": {
+            "passed": paired_gate_passed,
+            "partial_improvement_by_k": dict(zip(("V1", "V2", "V3"), partial_passes, strict=True)),
+            "verdict": "fit_for_next_bounded_stage" if paired_gate_passed else "no_go_for_full",
+        },
+        "protocol": "rgbd_paired_v1",
+        "selection": selection,
+        "status": "passed",
+        "stored_monitor_validated": False,
+        "tolerance": tolerance_value,
+        "validation": {
+            "availability_case_count": len(all_depth_availability_cases(4)),
+            "batch_size": evaluation_batch_size,
+            "identity_digest": baseline_snapshot.identity_digest,
+            "precision": "bf16_inference_fp32_scoring_float64_accumulation",
+            "sample_count": baseline_snapshot.sample_count,
+            "sequence_frames": 4,
+            "split": "val",
+        },
+    }
+    _atomic_json(report, destination)
+    return report
+
+
+def _validate_paired_run_configs(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
+    """Allow only batch size, initial head, and depth-input conditioning to differ."""
+
+    base_data = dict(_mapping(baseline, "data"))
+    candidate_data = dict(_mapping(candidate, "data"))
+    base_data.pop("batch_size", None)
+    candidate_data.pop("batch_size", None)
+    if base_data != candidate_data:
+        raise EvaluationError("paired run data configurations differ beyond batch_size")
+    base_model = dict(_mapping(baseline, "model"))
+    candidate_model = dict(_mapping(candidate, "model"))
+    base_initial_head = base_model.pop("initial_head_checkpoint", None)
+    candidate_initial_head = candidate_model.pop("initial_head_checkpoint", None)
+    if base_initial_head is not None or not isinstance(candidate_initial_head, str) or not candidate_initial_head:
+        raise EvaluationError("paired runs must compare a raw-head baseline to its conditioned continuation")
+    if base_model != candidate_model:
+        raise EvaluationError("paired model configurations differ beyond initial_head_checkpoint")
+    base_depth = baseline.get("depth_input")
+    if isinstance(base_depth, Mapping) and base_depth.get("enabled") is True:
+        raise EvaluationError("paired baseline must not enable depth_input")
+    candidate_depth = candidate.get("depth_input")
+    if not isinstance(candidate_depth, Mapping) or candidate_depth.get("enabled") is not True:
+        raise EvaluationError("paired candidate must enable depth_input")
+    if candidate_depth.get("patch_size") != 16:
+        raise EvaluationError("rgbd_paired_v1 requires depth_input.patch_size=16")
+    for key in set(baseline) | set(candidate):
+        if key not in {"data", "depth_input", "model"} and baseline.get(key) != candidate.get(key):
+            raise EvaluationError(f"paired run configuration differs at {key}")
+    if baseline.get("seed") != 42:
+        raise EvaluationError("rgbd_paired_v1 requires seed=42")
+    trainer = _mapping(baseline, "trainer")
+    if trainer.get("sequence_frames") != 4:
+        raise EvaluationError("rgbd_paired_v1 requires fixed four-frame sequences")
+    if (
+        base_model.get("precision") != "bf16"
+        or base_model.get("image_height") != 480
+        or base_model.get("image_width") != 640
+    ):
+        raise EvaluationError("rgbd_paired_v1 requires BF16 640x480 models")
+
+
+def _collect_paired_snapshot(
+    *,
+    conditioned: bool,
+    model: nn.Module,
+    batches: Iterable[Mapping[str, Any]],
+    device: torch.device,
+    precision: str,
+    max_batches: int | None,
+    **_: Any,
+) -> _PairedSnapshot:
+    cases = all_depth_availability_cases(4)
+    totals = {
+        case.case_id: {scope: DepthSufficientStatistics() for scope in ("all", "provided", "unprovided")}
+        for case in cases
+    }
+    pose_totals: dict[str, _ScalarStatistics] = {}
+    holdout_total = DepthSufficientStatistics()
+    holdout_error: str | None = None
+    identity = hashlib.sha256()
+    sample_count = 0
+    batch_count = 0
+    model.eval()
+    with torch.inference_mode():
+        for raw_batch in batches:
+            batch = _move_batch(raw_batch, device)
+            batch_size = _update_identity_digest(identity, batch)
+            sample_count += batch_size
+            images = batch.get("images")
+            target = batch.get("depths")
+            valid = batch.get("depth_masks")
+            scale = batch.get("normalization_scale_m")
+            frame_ids = batch.get("frame_ids")
+            if (
+                not isinstance(images, torch.Tensor)
+                or not isinstance(target, torch.Tensor)
+                or not isinstance(valid, torch.Tensor)
+                or not isinstance(scale, torch.Tensor)
+                or not isinstance(frame_ids, torch.Tensor)
+                or images.shape[:2] != (batch_size, 4)
+            ):
+                raise EvaluationError("rgbd_paired_v1 batch contract is invalid")
+            mapped_depth = target.unsqueeze(2)
+            mapped_mask = valid.unsqueeze(2)
+            if conditioned:
+                k4_predictions: Mapping[str, torch.Tensor] | None = None
+                for case in cases:
+                    availability = torch.tensor(case.mask, device=device).expand(batch_size, 4)
+                    with _autocast_context(device, precision):
+                        raw_predictions = model(
+                            images,
+                            mapped_depth=mapped_depth,
+                            valid_mask=mapped_mask,
+                            availability=availability,
+                        )
+                    predictions = _prediction_mapping(raw_predictions)
+                    _accumulate_case_depth(totals[case.case_id], predictions, batch, availability)
+                    if case.provided_frames == 4:
+                        k4_predictions = predictions
+                if k4_predictions is None:
+                    raise EvaluationError("rgbd_paired_v1 did not evaluate the k=4 case")
+                pose_totals = _merge_pose_statistics(pose_totals, _pose_statistics(k4_predictions, batch))
+                if holdout_error is None:
+                    try:
+                        holdout = build_input_depth_holdout(mapped_depth, mapped_mask, frame_ids, patch_size=16)
+                    except ValueError as error:
+                        holdout_error = str(error)
+                    else:
+                        with _autocast_context(device, precision):
+                            holdout_predictions = _prediction_mapping(
+                                model(
+                                    images,
+                                    mapped_depth=holdout.depth,
+                                    valid_mask=holdout.visible_mask,
+                                    availability=torch.ones(batch_size, 4, dtype=torch.bool, device=device),
+                                )
+                            )
+                        holdout_total = merge_depth_statistics(
+                            (
+                                holdout_total,
+                                depth_sufficient_statistics(
+                                    holdout_predictions["depth"],
+                                    target,
+                                    holdout.holdout_mask[:, :, 0],
+                                    scale,
+                                ),
+                            )
+                        )
+            else:
+                with _autocast_context(device, precision):
+                    predictions = _prediction_mapping(model(images))
+                for case in cases:
+                    availability = torch.tensor(case.mask, device=device).expand(batch_size, 4)
+                    _accumulate_case_depth(totals[case.case_id], predictions, batch, availability)
+                pose_totals = _merge_pose_statistics(pose_totals, _pose_statistics(predictions, batch))
+                if holdout_error is None:
+                    try:
+                        holdout = build_input_depth_holdout(mapped_depth, mapped_mask, frame_ids, patch_size=16)
+                    except ValueError as error:
+                        holdout_error = str(error)
+                    else:
+                        holdout_total = merge_depth_statistics(
+                            (
+                                holdout_total,
+                                depth_sufficient_statistics(
+                                    predictions["depth"], target, holdout.holdout_mask[:, :, 0], scale
+                                ),
+                            )
+                        )
+            batch_count += 1
+            if max_batches is not None and batch_count >= max_batches:
+                break
+    if batch_count == 0:
+        raise EvaluationError("rgbd_paired_v1 received no validation batches")
+    return _PairedSnapshot(
+        identity.hexdigest(),
+        sample_count,
+        totals,
+        pose_totals,
+        None if holdout_error is not None else holdout_total,
+        holdout_error,
+    )
+
+
+def _prediction_mapping(value: object) -> Mapping[str, torch.Tensor]:
+    if not isinstance(value, dict):
+        raise EvaluationError("paired model prediction must be an object")
+    prediction_mapping = cast(dict[str, object], value)
+    depth = prediction_mapping.get("depth")
+    pose = prediction_mapping.get("pose_enc")
+    if not isinstance(depth, torch.Tensor) or not isinstance(pose, torch.Tensor):
+        raise EvaluationError("paired model prediction requires depth and pose_enc tensors")
+    return cast(dict[str, torch.Tensor], prediction_mapping)
+
+
+def _update_identity_digest(digest: Any, batch: Mapping[str, Any]) -> int:
+    frame_ids = batch.get("frame_ids")
+    sequence_ids = batch.get("sequence_id")
+    scene_ids = batch.get("scene_id")
+    if not isinstance(frame_ids, torch.Tensor) or frame_ids.ndim != 2:
+        raise EvaluationError("paired batch frame_ids must have shape [B,S]")
+    batch_size = int(frame_ids.shape[0])
+    if not isinstance(sequence_ids, torch.Tensor) or sequence_ids.numel() != batch_size:
+        raise EvaluationError("paired batch sequence_id must contain one value per sample")
+    if not isinstance(scene_ids, (list, tuple)) or len(scene_ids) != batch_size:
+        raise EvaluationError("paired batch scene_id must contain one value per sample")
+    for index in range(batch_size):
+        scene = scene_ids[index]
+        if not isinstance(scene, str) or not scene:
+            raise EvaluationError("paired scene identities must be non-empty strings")
+        identity = [scene, int(sequence_ids.reshape(-1)[index]), [int(value) for value in frame_ids[index]]]
+        digest.update(json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        digest.update(b"\n")
+    return batch_size
+
+
+def _accumulate_case_depth(
+    totals: dict[str, DepthSufficientStatistics],
+    predictions: Mapping[str, torch.Tensor],
+    batch: Mapping[str, Any],
+    availability: torch.Tensor,
+) -> None:
+    target = cast(torch.Tensor, batch["depths"])
+    valid = cast(torch.Tensor, batch["depth_masks"])
+    scale = cast(torch.Tensor, batch["normalization_scale_m"])
+    provided = availability[:, :, None, None]
+    masks = {"all": valid, "provided": valid & provided, "unprovided": valid & ~provided}
+    for scope, mask in masks.items():
+        totals[scope] = merge_depth_statistics(
+            (totals[scope], depth_sufficient_statistics(predictions["depth"], target, mask, scale))
+        )
+
+
+def _pose_statistics(predictions: Mapping[str, torch.Tensor], batch: Mapping[str, Any]) -> dict[str, _ScalarStatistics]:
+    pose = predictions["pose_enc"].float()
+    extrinsics = cast(torch.Tensor, batch["extrinsics"]).float()
+    intrinsics = cast(torch.Tensor, batch["intrinsics"]).float()
+    images = cast(torch.Tensor, batch["images"])
+    frame_count = int(pose.shape[1])
+    pair_count = frame_count * (frame_count - 1) // 2
+    totals: dict[str, _ScalarStatistics] = {}
+    for index in range(int(pose.shape[0])):
+        camera = compute_camera_loss(
+            pose[index : index + 1],
+            extrinsics[index : index + 1],
+            intrinsics[index : index + 1],
+            (int(images.shape[-2]), int(images.shape[-1])),
+        )
+        pair_metrics = compute_pairwise_pose_loss(
+            pose[index : index + 1],
+            extrinsics[index : index + 1],
+            (int(images.shape[-2]), int(images.shape[-1])),
+        )
+        valid_pair_float = float(pair_metrics["pairwise_valid_direction_fraction"]) * pair_count
+        valid_pair_count = round(valid_pair_float)
+        if abs(valid_pair_float - valid_pair_count) > 1e-5:
+            raise EvaluationError("pairwise valid-direction count is not integral")
+        for name in ("camera", "camera_translation", "camera_rotation", "camera_fov"):
+            totals[name] = _add_scalar(totals.get(name), float(camera[name]), frame_count)
+        for name in ("pairwise_rotation_degrees", "pairwise_translation_magnitude"):
+            totals[name] = _add_scalar(totals.get(name), float(pair_metrics[name]), pair_count)
+        for name in ("pairwise_translation_direction_degrees", "rpa_5", "rpa_15", "rpa_30"):
+            totals[name] = _add_scalar(totals.get(name), float(pair_metrics[name]), valid_pair_count)
+        totals["pairwise_valid_direction_fraction"] = _add_scalar(
+            totals.get("pairwise_valid_direction_fraction"), valid_pair_count / pair_count, pair_count
+        )
+    return totals
+
+
+def _add_scalar(existing: _ScalarStatistics | None, value: float, count: int) -> _ScalarStatistics:
+    if not math.isfinite(value):
+        raise EvaluationError("paired scalar metric must be finite")
+    current = existing or _ScalarStatistics()
+    return _ScalarStatistics(current.total + value * count, current.count + count)
+
+
+def _merge_pose_statistics(
+    left: Mapping[str, _ScalarStatistics], right: Mapping[str, _ScalarStatistics]
+) -> dict[str, _ScalarStatistics]:
+    merged = dict(left)
+    for name, value in right.items():
+        current = merged.get(name, _ScalarStatistics())
+        merged[name] = _ScalarStatistics(current.total + value.total, current.count + value.count)
+    return merged
+
+
+def _candidate_comparison_report(
+    baseline: _PairedSnapshot,
+    candidate: _PairedSnapshot,
+    checkpoint: object,
+) -> dict[str, Any]:
+    if not isinstance(checkpoint, dict):
+        raise EvaluationError("paired candidate checkpoint report is invalid")
+    checkpoint_mapping = cast(dict[str, Any], checkpoint)
+    cases: dict[str, Any] = {}
+    for case in all_depth_availability_cases(4):
+        cases[case.case_id] = {
+            "provided_frames": case.provided_frames,
+            **{
+                scope: _depth_comparison(baseline.cases[case.case_id][scope], candidate.cases[case.case_id][scope])
+                for scope in ("all", "provided", "unprovided")
+            },
+        }
+    comparisons: dict[str, Any] = {}
+    for k in range(5):
+        scope = "all" if k in {0, 4} else "unprovided"
+        base_total = _merge_case_scope(baseline, k, scope)
+        candidate_total = _merge_case_scope(candidate, k, scope)
+        comparisons[f"V{k}"] = _depth_comparison(base_total, candidate_total)
+    primary_base = sum(cast(float, comparisons[f"V{k}"]["normalized_mae"]["baseline"]["value"]) for k in (1, 2, 3)) / 3
+    primary_candidate = (
+        sum(cast(float, comparisons[f"V{k}"]["normalized_mae"]["candidate"]["value"]) for k in (1, 2, 3)) / 3
+    )
+    comparisons["P"] = _value_comparison(primary_base, primary_candidate, count=3)
+    holdout: dict[str, Any]
+    if baseline.holdout is None or candidate.holdout is None:
+        holdout = {
+            "reason": candidate.holdout_error or baseline.holdout_error or "holdout_not_available",
+            "status": "not_available",
+        }
+    else:
+        holdout = {"status": "measured", **_depth_comparison(baseline.holdout, candidate.holdout)}
+    return {
+        "cases": cases,
+        "checkpoint": {
+            key: checkpoint_mapping[key]
+            for key in ("epoch", "filename", "global_step", "sha256", "stored_metric")
+            if key in checkpoint_mapping
+        },
+        "comparisons": comparisons,
+        "holdout": holdout,
+        "pose_k4": _pose_comparison(baseline.pose, candidate.pose),
+    }
+
+
+def _merge_case_scope(snapshot: _PairedSnapshot, k: int, scope: str) -> DepthSufficientStatistics:
+    return merge_depth_statistics(
+        snapshot.cases[case.case_id][scope] for case in all_depth_availability_cases(4) if case.provided_frames == k
+    )
+
+
+def _depth_comparison(baseline: DepthSufficientStatistics, candidate: DepthSufficientStatistics) -> dict[str, Any]:
+    if (
+        baseline.valid_pixel_count != candidate.valid_pixel_count
+        or baseline.near_valid_pixel_count != candidate.near_valid_pixel_count
+    ):
+        raise EvaluationError("paired depth comparisons must use identical pixel counts")
+    return {
+        "metric_mae_m": _sum_comparison(
+            baseline.metric_absolute_error_sum_m,
+            candidate.metric_absolute_error_sum_m,
+            baseline.valid_pixel_count,
+        ),
+        "near_depth_mae_m": _sum_comparison(
+            baseline.near_absolute_error_sum_m,
+            candidate.near_absolute_error_sum_m,
+            baseline.near_valid_pixel_count,
+        ),
+        "normalized_mae": _sum_comparison(
+            baseline.normalized_absolute_error_sum,
+            candidate.normalized_absolute_error_sum,
+            baseline.valid_pixel_count,
+        ),
+    }
+
+
+def _sum_comparison(baseline_sum: float, candidate_sum: float, count: int) -> dict[str, Any]:
+    baseline = metric_result(baseline_sum, count)
+    candidate = metric_result(candidate_sum, count)
+    baseline["absolute_error_sum"] = baseline_sum
+    candidate["absolute_error_sum"] = candidate_sum
+    return {"baseline": baseline, "candidate": candidate, **_difference_fields(baseline["value"], candidate["value"])}
+
+
+def _value_comparison(baseline: float, candidate: float, *, count: int) -> dict[str, Any]:
+    return {
+        "baseline": {"value": baseline, "count": count},
+        "candidate": {"value": candidate, "count": count},
+        **_difference_fields(baseline, candidate),
+    }
+
+
+def _difference_fields(baseline: object, candidate: object) -> dict[str, float | None]:
+    if baseline is None or candidate is None:
+        return {"difference": None, "difference_percent": None}
+    baseline_value = float(cast(float, baseline))
+    candidate_value = float(cast(float, candidate))
+    difference = candidate_value - baseline_value
+    return {
+        "difference": difference,
+        "difference_percent": None if baseline_value == 0 else 100 * difference / baseline_value,
+    }
+
+
+def _pose_comparison(
+    baseline: Mapping[str, _ScalarStatistics], candidate: Mapping[str, _ScalarStatistics]
+) -> dict[str, Any]:
+    if set(baseline) != set(candidate):
+        raise EvaluationError("paired pose metric sets differ")
+    report: dict[str, Any] = {}
+    for name in sorted(baseline):
+        if baseline[name].count != candidate[name].count:
+            raise EvaluationError("paired pose metric counts differ")
+        report[name] = _value_comparison(
+            cast(float, baseline[name].mean), cast(float, candidate[name].mean), count=baseline[name].count
+        )
+    return report
+
+
+def _select_paired_candidate(candidates: list[dict[str, Any]], tolerance: float) -> dict[str, Any]:
+    values = [float(candidate["comparisons"]["P"]["candidate"]["value"]) for candidate in candidates]
+    minimum = min(values)
+    equivalent = [index for index, value in enumerate(values) if value - minimum <= tolerance]
+    selected_index = min(equivalent, key=lambda index: int(candidates[index]["checkpoint"]["epoch"]))
+    ranking = sorted(
+        range(len(candidates)), key=lambda index: (values[index], candidates[index]["checkpoint"]["epoch"])
+    )
+    return {
+        "candidate_index": selected_index,
+        "equivalent_candidate_indices": equivalent,
+        "primary": "depth_unprovided_macro",
+        "ranking_candidate_indices": ranking,
+        "selected_checkpoint": candidates[selected_index]["checkpoint"],
+    }
+
+
+def _paired_guardrails(selected: Mapping[str, Any]) -> dict[str, Any]:
+    v4 = cast(Mapping[str, Any], cast(Mapping[str, Any], selected["comparisons"])["V4"])
+    pose = cast(Mapping[str, Any], selected["pose_k4"])
+    depth_metric = cast(Mapping[str, Any], v4["near_depth_mae_m"])
+    camera_metric = cast(Mapping[str, Any], pose["camera_translation"])
+    camera = cast(Mapping[str, Any], pose["camera"])
+    normalized = cast(Mapping[str, Any], v4["normalized_mae"])
+    base_objective = 5 * float(cast(Mapping[str, Any], camera["baseline"])["value"]) + float(
+        cast(Mapping[str, Any], normalized["baseline"])["value"]
+    )
+    candidate_objective = 5 * float(cast(Mapping[str, Any], camera["candidate"])["value"]) + float(
+        cast(Mapping[str, Any], normalized["candidate"])["value"]
+    )
+    metrics = {
+        "near_depth_mae_m": _guardrail_metric(depth_metric, absolute_tolerance=0.01),
+        "camera_translation": _guardrail_metric(camera_metric, absolute_tolerance=0.01),
+        "objective": _guardrail_metric(
+            _value_comparison(base_objective, candidate_objective, count=1), absolute_tolerance=0.02
+        ),
+    }
+    return {"metrics": metrics, "relative_tolerance": 0.1}
+
+
+def _guardrail_metric(comparison: Mapping[str, Any], *, absolute_tolerance: float) -> dict[str, Any]:
+    baseline = float(cast(Mapping[str, Any], comparison["baseline"])["value"])
+    candidate = float(cast(Mapping[str, Any], comparison["candidate"])["value"])
+    limit = baseline + max(abs(baseline) * 0.1, absolute_tolerance)
+    return {
+        "absolute_tolerance": absolute_tolerance,
+        "baseline": baseline,
+        "candidate": candidate,
+        "limit": limit,
+        "passed": candidate <= limit,
+    }
+
+
+def _required_improvement(comparison: Mapping[str, Any], tolerance: float) -> bool:
+    difference = comparison.get("difference")
+    return isinstance(difference, (int, float)) and not isinstance(difference, bool) and float(difference) < -tolerance
 
 
 def _attach_configured_training_wrappers(
@@ -910,12 +1607,19 @@ def _attach_configured_training_wrappers(
 ) -> tuple[PreparedTrainingModel, object, bool]:
     """Rebuild training wrappers in the same base→pixel→dynamic order as the runner."""
 
+    depth_config = resolved_config.get("depth_input")
+    depth_enabled = isinstance(depth_config, Mapping) and depth_config.get("enabled") is True
     pixel_config = resolved_config.get("pixel_depth")
     pixel_enabled = isinstance(pixel_config, Mapping) and pixel_config.get("enabled") is True
+    dynamic_config = resolved_config.get("dynamic_geometry")
+    dynamic_enabled = isinstance(dynamic_config, Mapping) and dynamic_config.get("enabled") is True
+    if depth_enabled and (pixel_enabled or dynamic_enabled):
+        raise EvaluationError("depth_input cannot be combined with pixel_depth or dynamic_geometry")
+    if depth_enabled:
+        prepared = attach_depth_input_model(prepared, cast(Mapping[str, object], depth_config), device=device)
     if pixel_enabled:
         prepared = attach_pixel_depth_model(prepared, cast(Mapping[str, object], pixel_config), device=device)
-    dynamic_config = resolved_config.get("dynamic_geometry")
-    if isinstance(dynamic_config, Mapping) and dynamic_config.get("enabled") is True:
+    if dynamic_enabled:
         prepared = attach_dynamic_geometry_model(
             prepared,
             cast(Mapping[str, object], dynamic_config),

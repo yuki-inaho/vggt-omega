@@ -15,6 +15,7 @@ from vggt_omega.training.evaluation import (
     EvaluationError,
     _validate_completed_summary,
     _validation_loss_options,
+    evaluate_rgbd_conditioning,
     evaluate_training_checkpoints,
 )
 from vggt_omega.training.model_factory import PreparedTrainingModel
@@ -160,6 +161,36 @@ def test_evaluator_attaches_enabled_dynamic_wrapper(monkeypatch: pytest.MonkeyPa
     assert actual is prepared
     assert pixel_enabled is False
     assert captured == [(prepared, dynamic_config, torch.device("cpu"))]
+
+
+def test_evaluator_attaches_enabled_depth_input_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    prepared = PreparedTrainingModel(model=_TinyHeadModel(), trainable_parameter_names=("head",))
+    depth_config = {"enabled": True, "patch_size": 16, "embed_dim": 1024}
+    captured: list[tuple[PreparedTrainingModel, dict[str, Any], torch.device]] = []
+
+    def fake_attach(
+        value: PreparedTrainingModel,
+        config: dict[str, Any],
+        *,
+        device: torch.device,
+    ) -> PreparedTrainingModel:
+        captured.append((value, config, device))
+        return value
+
+    monkeypatch.setattr(evaluation_module, "attach_depth_input_model", fake_attach)
+    actual, _, pixel_enabled = evaluation_module._attach_configured_training_wrappers(
+        prepared,
+        {
+            "depth_input": depth_config,
+            "pixel_depth": {"enabled": False},
+            "dynamic_geometry": {"enabled": False},
+        },
+        device=torch.device("cpu"),
+    )
+
+    assert actual is prepared
+    assert pixel_enabled is False
+    assert captured == [(prepared, depth_config, torch.device("cpu"))]
 
 
 def test_validation_dataset_receives_dynamic_flow_teacher_manifest(tmp_path: Path) -> None:
@@ -783,3 +814,215 @@ def test_evaluation_cli_passes_explicit_depth_thresholds(tmp_path: Path, monkeyp
         == 0
     )
     assert captured["depth_thresholds_m"] == (0.6, 1.2)
+
+
+def test_paired_protocol_preserves_legacy_checkpoint_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    expected = {"format_version": 2, "protocol": "rgbd_paired_v1", "status": "passed"}
+    captured: dict[str, Any] = {}
+
+    def fake_paired(base_run_dir: str, candidate_run_dir: str, **kwargs: Any) -> dict[str, Any]:
+        captured.update({"base_run_dir": base_run_dir, "candidate_run_dir": candidate_run_dir, **kwargs})
+        return expected
+
+    monkeypatch.setattr("scripts.evaluate_training_checkpoints.evaluate_rgbd_conditioning", fake_paired)
+    assert (
+        evaluation_cli_main(
+            [
+                "--protocol",
+                "rgbd_paired_v1",
+                "--paired-baseline-run",
+                str(tmp_path / "base"),
+                "--run-dir",
+                str(tmp_path / "candidate"),
+                "--output",
+                str(tmp_path / "comparison.json"),
+                "--original-cwd",
+                str(tmp_path / "repo"),
+                "--device",
+                "cpu",
+                "--eval-batch-size",
+                "2",
+                "--checkpoint-limit",
+                "3",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "base_run_dir": str(tmp_path / "base"),
+        "candidate_run_dir": str(tmp_path / "candidate"),
+        "checkpoint_limit": 3,
+        "device": "cpu",
+        "evaluation_batch_size": 2,
+        "original_cwd": str(tmp_path / "repo"),
+        "output_path": str(tmp_path / "comparison.json"),
+        "tolerance": 1e-4,
+    }
+    assert json.loads(capsys.readouterr().out) == expected
+
+    with pytest.raises(SystemExit):
+        evaluation_cli_main(
+            [
+                "--run-dir",
+                str(tmp_path / "candidate"),
+                "--output",
+                str(tmp_path / "legacy.json"),
+                "--original-cwd",
+                str(tmp_path / "repo"),
+                "--paired-baseline-run",
+                str(tmp_path / "base"),
+            ]
+        )
+
+    assert callable(evaluate_rgbd_conditioning)
+
+
+class _TinyPairedModel(torch.nn.Module):
+    def __init__(self, depth_value: float) -> None:
+        super().__init__()
+        self.depth_value = depth_value
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        mapped_depth: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+        availability: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        batch_size, frames, _, height, width = images.shape
+        pose = torch.zeros(batch_size, frames, 9, device=images.device)
+        pose[..., 6] = 1
+        return {
+            "depth": torch.full(
+                (batch_size, frames, height, width, 1),
+                self.depth_value,
+                device=images.device,
+            ),
+            "pose_enc": pose,
+        }
+
+
+def test_rgbd_paired_evaluator_reuses_strict_evaluator_and_writes_new_report(tmp_path: Path) -> None:
+    base_run = tmp_path / "base"
+    candidate_run = tmp_path / "candidate"
+    base_run.mkdir()
+    candidate_run.mkdir()
+    common = {
+        "data": {"batch_size": 8, "root": "/data", "val_split": "val"},
+        "model": {
+            "image_height": 480,
+            "image_width": 640,
+            "initial_head_checkpoint": None,
+            "precision": "bf16",
+        },
+        "seed": 42,
+        "trainer": {"sequence_frames": 4},
+    }
+    _write_json(base_run / "resolved_config.json", {**common, "depth_input": None})
+    candidate_config = json.loads(json.dumps(common))
+    candidate_config["data"]["batch_size"] = 2
+    candidate_config["model"]["initial_head_checkpoint"] = "base/checkpoints/best_epoch_000009_test.pt"
+    candidate_config["depth_input"] = {"enabled": True, "patch_size": 16}
+    _write_json(candidate_run / "resolved_config.json", candidate_config)
+    calls: list[dict[str, Any]] = []
+    candidate_identity = {"sequence_id": 7}
+
+    def fake_strict_evaluator(run_dir: Path, **kwargs: Any) -> dict[str, Any]:
+        is_candidate = Path(run_dir) == candidate_run
+        calls.append({"candidate": is_candidate, **kwargs})
+        batch_size = 1
+        intrinsics = torch.eye(3).reshape(1, 1, 3, 3).expand(batch_size, 4, 3, 3).clone()
+        intrinsics[..., 0, 0] = 10
+        intrinsics[..., 1, 1] = 10
+        intrinsics[..., 0, 2] = 16
+        intrinsics[..., 1, 2] = 16
+        batch = {
+            "depth_masks": torch.ones(batch_size, 4, 32, 32, dtype=torch.bool),
+            "depths": torch.ones(batch_size, 4, 32, 32),
+            "extrinsics": torch.eye(4)[:3].reshape(1, 1, 3, 4).expand(batch_size, 4, 3, 4).clone(),
+            "frame_ids": torch.tensor([[0, 2, 3, 4]]),
+            "images": torch.zeros(batch_size, 4, 3, 32, 32),
+            "intrinsics": intrinsics,
+            "normalization_scale_m": torch.ones(batch_size),
+            "scene_id": ["scene"],
+            "sequence_id": torch.tensor([candidate_identity["sequence_id"] if is_candidate else 7]),
+        }
+        count = 2 if is_candidate else 1
+        checkpoints = []
+        for index in range(count):
+            kwargs["validator"](
+                model=_TinyPairedModel(0.5 if is_candidate else 1.0),
+                batches=[batch],
+                device=torch.device("cpu"),
+                precision="bf16",
+                max_batches=None,
+            )
+            epoch = 2 + index
+            checkpoints.append(
+                {
+                    "epoch": epoch if is_candidate else 9,
+                    "filename": f"best_epoch_{epoch:06d}_test.pt" if is_candidate else "best_epoch_000009_test.pt",
+                    "global_step": 10 + index,
+                    "sha256": chr(ord("b") + index) * 64 if is_candidate else "a" * 64,
+                    "stored_metric": 1.0,
+                }
+            )
+        return {
+            "base_checkpoint": {"filename": "base.pt", "sha256": "f" * 64, "size_bytes": 1},
+            "checkpoints": checkpoints,
+            "initial_head_checkpoint": (
+                {"filename": "best_epoch_000009_test.pt", "sha256": "a" * 64} if is_candidate else None
+            ),
+        }
+
+    output = tmp_path / "comparison.json"
+    report = evaluate_rgbd_conditioning(
+        base_run,
+        candidate_run,
+        output_path=output,
+        original_cwd=tmp_path,
+        device="cpu",
+        checkpoint_limit=2,
+        evaluation_batch_size=1,
+        checkpoint_evaluator=fake_strict_evaluator,
+    )
+
+    assert report["status"] == "passed"
+    assert report["protocol"] == "rgbd_paired_v1"
+    assert report["validation"]["availability_case_count"] == 16
+    assert report["validation"]["sample_count"] == 1
+    assert len(report["candidates"]) == 2
+    assert report["selection"]["selected_checkpoint"]["epoch"] == 2
+    assert report["candidates"][0]["comparisons"]["V2"]["normalized_mae"]["baseline"]["count"] > 0
+    assert report["candidates"][0]["comparisons"]["V2"]["normalized_mae"]["candidate"]["count"] > 0
+    assert report["candidates"][0]["holdout"]["status"] == "measured"
+    assert json.loads(output.read_text(encoding="utf-8")) == report
+    assert [call["candidate"] for call in calls] == [False, True]
+    assert all(call["validate_stored_monitor"] is False for call in calls)
+    assert all(call["evaluation_batch_size"] == 1 for call in calls)
+    with pytest.raises(EvaluationError, match="must not already exist"):
+        evaluate_rgbd_conditioning(
+            base_run,
+            candidate_run,
+            output_path=output,
+            original_cwd=tmp_path,
+            device="cpu",
+            checkpoint_evaluator=fake_strict_evaluator,
+        )
+    candidate_identity["sequence_id"] = 8
+    mismatched_output = tmp_path / "mismatched.json"
+    with pytest.raises(EvaluationError, match="identities or ordering"):
+        evaluate_rgbd_conditioning(
+            base_run,
+            candidate_run,
+            output_path=mismatched_output,
+            original_cwd=tmp_path,
+            device="cpu",
+            checkpoint_limit=2,
+            evaluation_batch_size=1,
+            checkpoint_evaluator=fake_strict_evaluator,
+        )
+    assert not mismatched_output.exists()
