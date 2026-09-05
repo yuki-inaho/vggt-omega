@@ -87,7 +87,11 @@ demo *ARGS:
 demo-text *ARGS:
     {{uv}} python demo_gradio.py --checkpoint {{ckpt_256}} --image-resolution 256 --enable-alignment {{ARGS}}
 
-# Browse paired RGB, mapped depth, and valid masks without a checkpoint or GPU.
+# Inspect paired RGB-D inputs and run the official OmniVGGT checkpoint.
+omnivggt-viewer root="/workspace/data/vggt_omega/colmap_rgbd_640x480_v1" *ARGS:
+    {{uv}} python demo_rgbd_gradio.py --dataset-root "{{root}}" {{ARGS}}
+
+# Backward-compatible entry point for the combined input/inference viewer.
 rgbd-viewer root="/workspace/data/vggt_omega/colmap_rgbd_640x480_v1" *ARGS:
     {{uv}} python demo_rgbd_gradio.py --dataset-root "{{root}}" {{ARGS}}
 

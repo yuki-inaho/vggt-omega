@@ -130,13 +130,13 @@ provided RGB-D configuration), while a base-only model retains the original
 `--preprocess-mode fixed --target-height 384 --target-width 512`. A `.zst`
 checkpoint must be decompressed before loading.
 
-### RGB-D input viewer
+### OmniVGGT RGB-D inference viewer
 
-Use the checkpoint-free Gradio viewer to inspect the RGB, mapped depth, valid
-mask, and RGB-depth overlay that will be presented to the RGB-D input adapter:
+Use the Gradio viewer to pair an RGB selection with mapped depth and a valid
+mask, inspect that input, and run the official OmniVGGT checkpoint:
 
 ```bash
-just rgbd-viewer
+just omnivggt-viewer
 ```
 
 The default root is
@@ -148,7 +148,27 @@ copies are matched by basename and, only when that basename occurs in multiple
 scenes, by file digest; an unresolved ambiguity is reported instead of choosing
 a frame silently. Dropped uploads take precedence over any dropdown selection
 and render automatically, so hidden initial selections are never mixed in.
-Source files are read-only and neither a checkpoint nor CUDA is required.
+Source files are read-only. The input inspection section does not load a model.
+
+The explicit **Run OmniVGGT inference** button loads the external official
+implementation and checkpoint, injects mapped depth for every selected frame,
+and displays:
+
+- OmniVGGT predicted depth, confidence, RGB-depth overlay, and scale-aligned
+  error against mapped depth;
+- per-frame comparison metrics and predicted camera parameters;
+- a browser-visible colored 3D reconstruction with camera axes, plus its GLB
+  download.
+
+The defaults expect official code at
+`/workspace/external/OmniVGGT-official` and the official weight at
+`/workspace/models/OmniVGGT/OmniVGGT.safetensors`. Keep both outside this Git
+repository. The tested official code revision is
+`c8cbfc6bcd57a07bf08a1f97804da9827847af8c`; the expected weight SHA-256 is
+`c9c3772b9bbfc648fa95ebffb3d9ff856f21e9b9712685eb0f98add53897969d`.
+Override either location with `--omnivggt-repository` or
+`--omnivggt-checkpoint`. CUDA is used by default; use `--device cpu` only for
+debugging because the 1.2B-parameter model is substantially slower there.
 
 The loader is reusable without Gradio through
 `vggt_omega.rgbd_viewer.RgbdDatasetIndex`, `RgbdLoaderConfig`, and
@@ -169,8 +189,9 @@ uv run --extra demo python demo_rgbd_gradio.py \
   --depth-scale-to-m 0.001
 ```
 
-Run `uv run --extra demo python demo_rgbd_gradio.py --help` for server and
-layout options.
+Run `uv run --extra demo python demo_rgbd_gradio.py --help` for runtime, server,
+and layout options. `just rgbd-viewer` remains as a compatibility alias-like
+entry point to the same combined viewer.
 
 ### Camera-motion curriculum fine-tuning
 

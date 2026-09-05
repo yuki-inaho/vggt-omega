@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 
 import demo_rgbd_gradio
+from vggt_omega.omnivggt_inference import OmniVggtInferenceResult
 
 
 def _dataset(root: Path) -> None:
@@ -100,6 +101,66 @@ def test_cli_and_ui_build_without_a_model_or_cuda(tmp_path: Path) -> None:
     assert isinstance(demo, gr.Blocks)
     config = demo.get_config_file()
     labels = {component["props"].get("label") for component in config["components"]}
-    assert {"RGB frames", "RGB uploads", "RGB-D views", "Frame statistics"} <= labels
+    assert {
+        "RGB frames",
+        "RGB uploads",
+        "RGB-D views",
+        "Frame statistics",
+        "OmniVGGT predictions",
+        "OmniVGGT frame comparison",
+        "Predicted cameras",
+        "OmniVGGT 3D reconstruction",
+        "Download OmniVGGT GLB",
+    } <= labels
     api_names = {dependency.get("api_name") for dependency in config["dependencies"]}
     assert "visualize_uploaded_rgb" in api_names
+    assert "run_omnivggt" in api_names
+
+
+def test_omnivggt_callback_resolves_rgbd_and_returns_model_outputs(tmp_path: Path, monkeypatch) -> None:
+    _dataset(tmp_path)
+    output_glb = tmp_path / "result.glb"
+    output_glb.write_bytes(b"glTF")
+    captured = {}
+
+    def fake_runtime(repository: str, checkpoint: str, device: str):
+        captured["runtime"] = (repository, checkpoint, device)
+        return object(), object()
+
+    def fake_infer(model, pose_decoder, prepared, **kwargs):
+        captured["prepared"] = prepared
+        captured["kwargs"] = kwargs
+        return OmniVggtInferenceResult(
+            gallery=((Image.new("RGB", (4, 4)), "predicted depth"),),
+            frame_statistics=((prepared.frame_ids[0], 100.0, 0.3, 0.4, 0.75, 0.01, 2.0),),
+            camera_statistics=((prepared.frame_ids[0], 0.0, 0.0, 0.0, 100.0, 101.0, 6.0, 4.0),),
+            glb_path=output_glb,
+            exported_points=96,
+            inference_seconds=1.25,
+        )
+
+    monkeypatch.setattr(demo_rgbd_gradio, "_get_omnivggt_runtime", fake_runtime)
+    monkeypatch.setattr(demo_rgbd_gradio, "infer_and_render", fake_infer)
+    config = demo_rgbd_gradio.loader_config("rgb", "depth", "valid_mask", "", "", "", 0.001, False, True)
+
+    gallery, frame_rows, camera_rows, model_path, download_path, status = demo_rgbd_gradio.run_omnivggt_selection(
+        tmp_path,
+        ["scenes/scene_000000/rgb/frame_000000.png"],
+        None,
+        config,
+        official_repository="/workspace/external/OmniVGGT-official",
+        checkpoint="/workspace/models/OmniVGGT/OmniVGGT.safetensors",
+        device="cpu",
+        target_size=28,
+        confidence_percentile=25,
+        max_points=1000,
+    )
+
+    assert len(gallery) == 1
+    assert str(frame_rows[0][0]).endswith("frame_000000.png")
+    assert camera_rows[0][4:6] == [100.0, 101.0]
+    assert model_path == download_path == str(output_glb)
+    assert "1.250 s" in status
+    assert "96" in status
+    assert captured["runtime"][2] == "cpu"
+    assert captured["prepared"].images.shape == (1, 3, 14, 28)
