@@ -1,4 +1,4 @@
-"""Run all four tomato RGB-D splits serially and aggregate their summaries."""
+"""Run named RGB-D dataset splits serially and aggregate their summaries."""
 
 from __future__ import annotations
 
@@ -9,13 +9,6 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
-
-DEFAULT_ORDER = (
-    "segment_03_camera_r",
-    "segment_02_camera_l",
-    "segment_04_camera_l",
-    "segment_01_camera_r",
-)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -98,7 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_ORDER))
+    parser.add_argument("--datasets", nargs="+", required=True)
     args = parser.parse_args(argv)
     summary = run_all(args.source_root, args.output_root, args.datasets)
     print(json.dumps(summary, indent=2, sort_keys=True))

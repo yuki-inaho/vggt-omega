@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.run_all_tomato_workflows import aggregate_summaries, run_all
+from scripts.run_all_rgbd_workflows import aggregate_summaries, run_all
 
 
 def test_aggregate_summaries_requires_every_dataset(tmp_path: Path) -> None:
