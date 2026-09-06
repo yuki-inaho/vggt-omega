@@ -980,6 +980,23 @@ def _initialize_head_from_checkpoint(
     }
 
 
+def _initial_head_state_names(checkpoint_path: Path) -> set[str]:
+    """Read initial-head parameter names to select pre- or post-wrapper loading."""
+
+    if checkpoint_path.is_symlink() or not checkpoint_path.is_file():
+        raise ValueError("initial head checkpoint must be a regular file")
+    try:
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("initial head checkpoint cannot be loaded safely") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("initial head checkpoint payload must be a mapping")
+    state = payload.get("model_state")
+    if not isinstance(state, Mapping):
+        raise ValueError("initial head checkpoint model_state is missing or invalid")
+    return {name for name in state if isinstance(name, str)}
+
+
 def _resolved_config(cfg: DictConfig) -> dict[str, Any]:
     value = OmegaConf.to_container(cfg, resolve=True)
     if not isinstance(value, dict):
@@ -2016,13 +2033,18 @@ def run_training(
     model = prepared.model
     base_metadata = _base_checkpoint_metadata(checkpoint_path)
     initial_head = cfg.model.initial_head_checkpoint
+    deferred_initial_head: Path | None = None
     if initial_head is not None:
-        base_metadata["initial_head_checkpoint"] = _initialize_head_from_checkpoint(
-            _resolve_path(str(initial_head), cwd),
-            model=model,
-            trainable_parameter_names=prepared.trainable_parameter_names,
-            expected_base_checkpoint=base_metadata["base_checkpoint"],
-        )
+        initial_head_path = _resolve_path(str(initial_head), cwd)
+        if _initial_head_state_names(initial_head_path) == set(prepared.trainable_parameter_names):
+            base_metadata["initial_head_checkpoint"] = _initialize_head_from_checkpoint(
+                initial_head_path,
+                model=model,
+                trainable_parameter_names=prepared.trainable_parameter_names,
+                expected_base_checkpoint=base_metadata["base_checkpoint"],
+            )
+        else:
+            deferred_initial_head = initial_head_path
     pixel_config = _pixel_depth_config(cfg)
     pixel_runtime_options = _pixel_depth_runtime_options(pixel_config)
     if pixel_config is not None:
@@ -2032,6 +2054,13 @@ def run_training(
     if dynamic_config is not None:
         prepared = attach_dynamic_geometry_model(prepared, dynamic_config, device=device)
         model = prepared.model
+    if deferred_initial_head is not None:
+        base_metadata["initial_head_checkpoint"] = _initialize_head_from_checkpoint(
+            deferred_initial_head,
+            model=model,
+            trainable_parameter_names=prepared.trainable_parameter_names,
+            expected_base_checkpoint=base_metadata["base_checkpoint"],
+        )
     performance_config = _performance_config(cfg)
     compile_options = performance_config.get("compile")
     if not isinstance(compile_options, Mapping):
