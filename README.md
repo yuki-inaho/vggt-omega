@@ -200,6 +200,26 @@ RGB depth to estimate one robust metric scale per VGGT chunk, then chains
 overlapping chunks into an initial global alignment and fuses masked point
 clouds.
 
+For the staged 640x480 contract, `scripts/reconstruct_rgbd_video.py` performs
+the same metric-scale correction and writes a fused PLY plus synchronized RGB-D
+MP4 previews. It uses the accepted compact head at its recorded 384x512 model
+grid and anchors each short inference window by the staged camera-to-world pose
+of its first frame:
+
+```bash
+pixi run python scripts/reconstruct_rgbd_video.py \
+  --data-root /workspace/data/vggt_omega/colmap_rgbd_640x480_v1 \
+  --base-checkpoint checkpoints/vggt_omega_1b_512.pt \
+  --head-checkpoint checkpoints/accepted_near_depth_best.pt \
+  --output-dir /path/to/vggt-rgbd-reconstruction \
+  --device cuda
+```
+
+The prediction video places input RGB, VGGT metric depth, and measured depth
+side by side. The reconstruction-render video reprojects the fused point cloud
+at the recorded camera poses. The latter is a chunk-anchored diagnostic, not a
+single globally optimized long-sequence bundle adjustment.
+
 ## COLMAP-compatible export
 
 ```bash
