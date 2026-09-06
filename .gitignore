@@ -44,5 +44,7 @@ predictions.npz
 # Local working documents and scratch output
 temp/
 
-# Operational documentation is kept outside this repository
-docs/
+# Track the sanitized onboarding entrypoint while keeping local operational
+# documents outside the public repository.
+docs/*
+!docs/ONBOARDING.md
