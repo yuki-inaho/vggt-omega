@@ -1811,14 +1811,17 @@ def _total_optimizer_steps(cfg: DictConfig, dataset_length: int) -> int:
             for epoch in range(train_epochs)
         )
     elif pixel_config is not None:
-        train_epochs = sum(
-            bool(
-                cast(Mapping[str, object], _pixel_depth_runtime_options(pixel_config, epoch=epoch)["curriculum"])[
-                    "train_enabled"
-                ]
+        enabled_epochs = 0
+        for epoch in range(train_epochs):
+            runtime = _pixel_depth_runtime_options(pixel_config, epoch=epoch)
+            assert runtime is not None
+            curriculum = runtime.get("curriculum")
+            enabled_epochs += (
+                bool(cast(Mapping[str, object], curriculum)["train_enabled"])
+                if isinstance(curriculum, Mapping)
+                else True
             )
-            for epoch in range(train_epochs)
-        )
+        train_epochs = enabled_epochs
     planned = steps_per_epoch * train_epochs
     max_steps = cfg.trainer.max_train_steps
     return max(1, min(planned, int(max_steps)) if max_steps is not None else planned)

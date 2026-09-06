@@ -12,10 +12,12 @@ extra-index-urls = ["https://download.pytorch.org/whl/cu128"]
 
 [pypi-dependencies]
 jaxtyping = ">=0.3.7"
-vggt-omega = { path = ".", editable = true, extras = ["demo", "rgbd"] }
+pytest = ">=9.0.3"
+vggt-omega = { path = ".", editable = true, extras = ["demo", "rgbd", "training"] }
 
 [activation.env]
 PYTHONNOUSERSITE = "1"
 
 [tasks]
 verify-gpu = "python -c 'import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0))'"
+train-rgbd = "python scripts/train_colmap_rgbd.py"

@@ -220,6 +220,26 @@ side by side. The reconstruction-render video reprojects the fused point cloud
 at the recorded camera poses. The latter is a chunk-anchored diagnostic, not a
 single globally optimized long-sequence bundle adjustment.
 
+For a Pixel-Perfect run with the RGB-D correspondence head enabled, export the
+refined metric depth together with learned image-space correspondence flow and
+the measured RGB-D geometry target:
+
+```bash
+pixi run python scripts/infer_pixel_perfect_rgbd_flow.py \
+  --run-dir /path/to/training-run \
+  --checkpoint /path/to/training-run/checkpoints/last.pt \
+  --data-root /workspace/data/vggt_omega/colmap_rgbd_640x480_v1 \
+  --output-dir /path/to/rgbd-flow-output \
+  --device cuda
+```
+
+The exporter writes separate RGB-D and flow videos, a combined six-panel
+preview, and a compressed NPZ containing metric depth, learned 2D pixel flow,
+RGB-D teacher flow, and teacher covisibility. The flow is 2D frame-to-frame
+correspondence, not 3D scene flow. Use the final `last.pt` from a staged run;
+an objective-best checkpoint selected before the correspondence stage need not
+contain a trained flow head.
+
 ## COLMAP-compatible export
 
 ```bash

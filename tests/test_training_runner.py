@@ -1007,6 +1007,20 @@ def test_total_optimizer_steps_excludes_validation_only_curriculum_epoch() -> No
     assert _total_optimizer_steps(cfg, dataset_length=28) == 10
 
 
+def test_total_optimizer_steps_accepts_pixel_depth_without_curriculum() -> None:
+    config_dir = Path(__file__).parents[1] / "configs" / "training"
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="config",
+            overrides=[
+                "pixel_depth=pixel_perfect_multiframe",
+                "trainer=smoke",
+            ],
+        )
+
+    assert _total_optimizer_steps(cfg, dataset_length=28) == 3
+
+
 def test_curriculum_guardrail_reports_only_excess_degradation() -> None:
     guardrail = {
         "enabled": True,
