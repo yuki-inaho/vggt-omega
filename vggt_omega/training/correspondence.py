@@ -63,7 +63,7 @@ def validate_external_teacher_targets(
 
 
 class FactoredCorrespondenceHead(nn.Module):
-    """Predict source-to-target pixel flow from source geometry and target camera."""
+    """Predict a source-to-target residual over camera/depth reprojection flow."""
 
     def __init__(self, *, geometry_dim: int, camera_dim: int, hidden_dim: int) -> None:
         super().__init__()
@@ -147,6 +147,67 @@ class FactoredCorrespondenceHead(nn.Module):
         if not predictions:
             raise ValueError("pair_indices must contain at least one directed pair")
         return torch.cat(predictions, dim=1)
+
+
+def project_depth_correspondence_flow(
+    depths: torch.Tensor,
+    intrinsics: torch.Tensor,
+    extrinsics_w2c: torch.Tensor,
+    pair_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Project predicted source depth into each target camera as dense pixel flow."""
+
+    if depths.ndim != 4:
+        raise ValueError("depths must have shape [B,S,H,W]")
+    batch_size, frame_count, height, width = depths.shape
+    if intrinsics.shape != (batch_size, frame_count, 3, 3):
+        raise ValueError("intrinsics must have shape [B,S,3,3]")
+    if extrinsics_w2c.shape != (batch_size, frame_count, 3, 4):
+        raise ValueError("extrinsics_w2c must have shape [B,S,3,4]")
+    if pair_indices.ndim != 3 or pair_indices.shape[0] != batch_size or pair_indices.shape[2] != 2:
+        raise ValueError("pair_indices must have shape [B,Q,2]")
+    if pair_indices.dtype is not torch.long:
+        raise ValueError("pair_indices must use int64 dtype")
+    values = (depths, intrinsics, extrinsics_w2c)
+    if any(not value.is_floating_point() or not torch.isfinite(value).all() for value in values):
+        raise ValueError("predicted correspondence geometry must be finite floating point")
+    if any(value.device != depths.device for value in (*values, pair_indices)):
+        raise ValueError("predicted correspondence inputs must share a device")
+    if torch.any((pair_indices < 0) | (pair_indices >= frame_count)):
+        raise ValueError("pair_indices are outside the frame range")
+    if torch.any(pair_indices[..., 0] == pair_indices[..., 1]):
+        raise ValueError("directed correspondence pairs must use distinct frames")
+
+    rows = torch.arange(height, dtype=depths.dtype, device=depths.device)
+    columns = torch.arange(width, dtype=depths.dtype, device=depths.device)
+    vertical, horizontal = torch.meshgrid(rows, columns, indexing="ij")
+    pixels = torch.stack((horizontal, vertical, torch.ones_like(horizontal)), dim=-1).reshape(-1, 3)
+    pixel_xy = pixels[:, :2].reshape(height, width, 2)
+    batches: list[torch.Tensor] = []
+    for batch_index in range(batch_size):
+        flows: list[torch.Tensor] = []
+        for source_value, target_value in pair_indices[batch_index]:
+            source = int(source_value)
+            target = int(target_value)
+            source_points = torch.linalg.solve(intrinsics[batch_index, source], pixels.T).T
+            source_points = source_points * depths[batch_index, source].reshape(-1, 1)
+            source_rotation = extrinsics_w2c[batch_index, source, :3, :3]
+            source_translation = extrinsics_w2c[batch_index, source, :3, 3]
+            world_points = (source_points - source_translation) @ source_rotation
+            target_rotation = extrinsics_w2c[batch_index, target, :3, :3]
+            target_translation = extrinsics_w2c[batch_index, target, :3, 3]
+            target_points = world_points @ target_rotation.T + target_translation
+            target_z = target_points[:, 2]
+            safe_z = torch.where(
+                target_z.abs() > torch.finfo(depths.dtype).eps,
+                target_z,
+                torch.ones_like(target_z),
+            )
+            projected = target_points @ intrinsics[batch_index, target].T
+            target_xy = torch.stack((projected[:, 0] / safe_z, projected[:, 1] / safe_z), dim=-1)
+            flows.append(target_xy.reshape(height, width, 2) - pixel_xy)
+        batches.append(torch.stack(flows))
+    return torch.stack(batches)
 
 
 def _positive_hw(name: str, value: tuple[int, int]) -> tuple[int, int]:
@@ -320,3 +381,23 @@ def masked_generalized_charbonnier(
     squared_error = (prediction - target).square().sum(dim=-1)
     robust = (squared_error + epsilon**2).pow(alpha) - epsilon ** (2 * alpha)
     return robust[mask].mean()
+
+
+def masked_endpoint_error(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return mean flow endpoint error in pixels over covisible targets."""
+
+    if prediction.ndim != 5 or prediction.shape[-1] != 2 or target.shape != prediction.shape:
+        raise ValueError("prediction and target must match [B,Q,H,W,2]")
+    if mask.shape != prediction.shape[:-1] or mask.dtype is not torch.bool:
+        raise ValueError("mask must be bool with shape [B,Q,H,W]")
+    if any(value.device != prediction.device for value in (target, mask)):
+        raise ValueError("prediction, target, and mask must share a device")
+    if any(not value.is_floating_point() or not torch.isfinite(value).all() for value in (prediction, target)):
+        raise ValueError("prediction and target must be finite floating point")
+    if not bool(mask.any()):
+        return prediction.reshape(-1)[0] * 0
+    return torch.linalg.vector_norm(prediction - target, dim=-1)[mask].mean()

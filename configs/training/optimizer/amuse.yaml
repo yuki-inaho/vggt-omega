@@ -2,6 +2,7 @@ name: amuse
 scheduler: none
 muon_lr: 1.0e-4
 aux_lr: 1.0e-5
+correspondence_output_lr: null
 aux_update_type: adamw
 beta1: 0.4
 beta2: 0.999

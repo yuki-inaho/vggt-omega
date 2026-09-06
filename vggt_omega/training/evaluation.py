@@ -26,6 +26,7 @@ from vggt_omega.training.model_factory import (
 )
 from vggt_omega.training.runner import (
     _dynamic_geometry_runtime_options,
+    _pixel_depth_runtime_options,
     _renderer_options,
     validate_one_epoch,
 )
@@ -49,6 +50,7 @@ _MONITOR_TO_METRIC = {
     "val/rpa_15": "rpa_15",
     "val/rpa_30": "rpa_30",
     "val/near_edge_objective": "near_edge_objective",
+    "val/correspondence_epe_px": "correspondence_epe_px",
     "val/dynamic_classification": "dynamic_classification",
 }
 _LOSS_WEIGHT_KEYS = (
@@ -838,10 +840,10 @@ def evaluate_training_checkpoints(
                 renderer_options=validation_renderer_options,
                 depth_thresholds_m=validated_thresholds_m,
                 pixel_depth_options=(
-                    {
-                        **dict(cast(Mapping[str, object], pixel_config["flow"])),
-                        "max_depth_m": float(cast(Mapping[str, object], pixel_config["geometry"])["max_depth_m"]),
-                    }
+                    _pixel_depth_runtime_options(
+                        cast(Mapping[str, Any], pixel_config),
+                        epoch=int(entry["epoch"]),
+                    )
                     if pixel_enabled and isinstance(pixel_config, Mapping)
                     else None
                 ),

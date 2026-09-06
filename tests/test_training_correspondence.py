@@ -7,7 +7,9 @@ from vggt_omega.training.correspondence import (
     CORRESPONDENCE_COORDINATE_SPACE,
     FactoredCorrespondenceHead,
     build_rgbd_correspondence_targets,
+    masked_endpoint_error,
     masked_generalized_charbonnier,
+    project_depth_correspondence_flow,
     validate_external_teacher_targets,
 )
 
@@ -62,6 +64,15 @@ def test_rgbd_correspondence_identity_and_direction_reversal() -> None:
     assert directed["covisibility_mask"][0, 1, 2, 3]
     assert directed["flow_pixels"][0, 0, 2, 3, 0].item() == pytest.approx(1.0)
     assert directed["flow_pixels"][0, 1, 2, 3, 0].item() == pytest.approx(-1.0)
+
+    projected = project_depth_correspondence_flow(
+        depths,
+        intrinsics,
+        extrinsics,
+        torch.tensor([[[0, 1], [1, 0]]]),
+    )
+    assert projected[0, 0, 2, 3, 0].item() == pytest.approx(1.0)
+    assert projected[0, 1, 2, 3, 0].item() == pytest.approx(-1.0)
 
 
 def test_rgbd_correspondence_masks_nonoverlap_dynamic_and_far_pixels() -> None:
@@ -198,6 +209,20 @@ def test_empty_correspondence_mask_returns_graph_connected_zero() -> None:
     assert loss.item() == 0.0
     loss.backward()
     assert prediction.grad is not None and torch.count_nonzero(prediction.grad) == 0
+
+
+def test_masked_endpoint_error_reports_pixels_and_ignores_invalid_targets() -> None:
+    prediction = torch.tensor([[[[[3.0, 4.0], [100.0, 100.0]]]]], requires_grad=True)
+    target = torch.zeros_like(prediction)
+    mask = torch.tensor([[[[True, False]]]])
+
+    epe = masked_endpoint_error(prediction, target, mask)
+
+    assert epe.item() == pytest.approx(5.0)
+    epe.backward()
+    assert prediction.grad is not None
+    assert prediction.grad[..., 0, :].abs().sum().item() > 0
+    assert prediction.grad[..., 1, :].abs().sum().item() == 0
 
 
 def test_factored_head_has_finite_parameter_gradient() -> None:

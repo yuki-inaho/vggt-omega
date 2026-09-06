@@ -416,6 +416,78 @@ def test_evaluator_strictly_checks_and_recomputes_every_best_without_paths(tmp_p
     assert not list(output.parent.glob(".*.tmp"))
 
 
+def test_evaluator_rebuilds_epoch_specific_pixel_self_supervision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, original_cwd, config = _make_run(tmp_path)
+    pixel_config = {
+        "enabled": True,
+        "flow": {"seed_offset": 10, "objective_weight": 1.0},
+        "geometry": {"max_depth_m": 1.2},
+        "self_supervised": {
+            "gpa": {"enabled": True},
+            "correspondence": {"enabled": True},
+            "guardrail": {"enabled": False},
+            "curriculum": [
+                {
+                    "name": "baseline_parity",
+                    "start_epoch": 0,
+                    "flow_weight": 0.0,
+                    "gpa_weight": 0.0,
+                    "correspondence_weight": 0.0,
+                },
+                {
+                    "name": "full_joint",
+                    "start_epoch": 1,
+                    "flow_weight": 0.5,
+                    "gpa_weight": 0.05,
+                    "correspondence_weight": 0.1,
+                },
+            ],
+        },
+    }
+    config["pixel_depth"] = pixel_config
+    _write_json(run_dir / "resolved_config.json", config)
+    for checkpoint in (run_dir / "checkpoints").glob("*.pt"):
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        payload["config"] = config
+        torch.save(payload, checkpoint)
+    *_, model_factory, dataset_factory, _ = _evaluation_dependencies()
+    captured: list[dict[str, Any]] = []
+
+    def attach_wrappers(
+        prepared: PreparedTrainingModel,
+        resolved_config: dict[str, Any],
+        *,
+        device: torch.device,
+    ) -> tuple[PreparedTrainingModel, dict[str, Any], bool]:
+        assert resolved_config["pixel_depth"] == pixel_config
+        assert device == torch.device("cpu")
+        return prepared, pixel_config, True
+
+    def validator(*, model: torch.nn.Module, pixel_depth_options: dict[str, Any], **kwargs: Any) -> dict[str, float]:
+        captured.append(pixel_depth_options)
+        value = float(model.get_parameter("head").detach())
+        return {"camera": value / 5, "depth": 0.0, "objective": value}
+
+    monkeypatch.setattr(evaluation_module, "_attach_configured_training_wrappers", attach_wrappers)
+    report = evaluate_training_checkpoints(
+        run_dir,
+        output_path=tmp_path / "report.json",
+        original_cwd=original_cwd,
+        device="cpu",
+        model_factory=model_factory,
+        dataset_factory=dataset_factory,
+        validator=validator,
+    )
+
+    assert report["status"] == "passed"
+    assert [options["curriculum_stage_name"] for options in captured] == ["baseline_parity", "full_joint"]
+    assert captured[0]["correspondence"]["objective_weight"] == pytest.approx(0.0)
+    assert captured[1]["correspondence"]["objective_weight"] == pytest.approx(0.1)
+
+
 def test_evaluator_accepts_legacy_disabled_early_stopping_artifacts(tmp_path: Path) -> None:
     run_dir, original_cwd, config = _make_run(tmp_path)
     del config["trainer"]["early_stopping"]

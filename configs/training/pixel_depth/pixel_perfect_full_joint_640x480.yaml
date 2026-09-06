@@ -1,0 +1,71 @@
+defaults:
+  - pixel_perfect_gpa_correspondence_640x480
+  - _self_
+
+# The validator retains the six-stage audit vocabulary, while every training
+# stage after the untouched baseline jointly updates camera, dense depth,
+# Pixel-Perfect refinement, and 2D correspondence heads.
+self_supervised:
+  guardrail:
+    enabled: true
+  curriculum:
+    - name: baseline_parity
+      start_epoch: 0
+      train_enabled: false
+      train_refiner: false
+      train_correspondence: false
+      train_base_heads: false
+      flow_weight: 0.0
+      gpa_weight: 0.0
+      correspondence_weight: 0.0
+      learning_rate_scale: 0.0
+    - name: residual_gate
+      start_epoch: 1
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: true
+      train_base_heads: true
+      flow_weight: 0.5
+      gpa_weight: 0.05
+      correspondence_weight: 0.1
+      learning_rate_scale: 0.5
+    - name: gpa_warmup
+      start_epoch: 2
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: true
+      train_base_heads: true
+      flow_weight: 0.5
+      gpa_weight: 0.05
+      correspondence_weight: 0.1
+      learning_rate_scale: 0.5
+    - name: correspondence_head
+      start_epoch: 3
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: true
+      train_base_heads: true
+      flow_weight: 0.5
+      gpa_weight: 0.05
+      correspondence_weight: 0.1
+      learning_rate_scale: 0.5
+    - name: joint_low_lr
+      start_epoch: 4
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: true
+      train_base_heads: true
+      flow_weight: 0.5
+      gpa_weight: 0.05
+      correspondence_weight: 0.1
+      learning_rate_scale: 0.5
+    - name: near_depth_recovery
+      start_epoch: 5
+      train_enabled: true
+      train_refiner: true
+      train_correspondence: true
+      train_base_heads: true
+      flow_weight: 0.5
+      gpa_weight: 0.05
+      correspondence_weight: 0.1
+      learning_rate_scale: 0.5

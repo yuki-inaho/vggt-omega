@@ -233,12 +233,12 @@ pixi run python scripts/infer_pixel_perfect_rgbd_flow.py \
   --device cuda
 ```
 
-The exporter writes separate RGB-D and flow videos, a combined six-panel
-preview, and a compressed NPZ containing metric depth, learned 2D pixel flow,
-RGB-D teacher flow, and teacher covisibility. The flow is 2D frame-to-frame
-correspondence, not 3D scene flow. Use the final `last.pt` from a staged run;
-an objective-best checkpoint selected before the correspondence stage need not
-contain a trained flow head.
+The exporter writes separate RGB-D and flow videos, a combined seven-panel
+preview, and a compressed NPZ containing metric depth, camera/depth geometry
+flow, learned residual and total 2D pixel flow, RGB-D teacher flow, and teacher
+covisibility. The flow is 2D frame-to-frame correspondence, not 3D scene flow.
+Use a correspondence-EPE-ranked checkpoint from a full-joint run, or the final
+`last.pt` from a staged run when no flow-ranked checkpoint is available.
 
 ## COLMAP-compatible export
 

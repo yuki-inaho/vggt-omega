@@ -38,6 +38,7 @@ _VALIDATION_MONITORS = {
     "val/rpa_15",
     "val/rpa_30",
     "val/near_edge_objective",
+    "val/correspondence_epe_px",
     "val/dynamic_classification",
 }
 
@@ -348,6 +349,14 @@ def validate_training_config(cfg: DictConfig) -> None:
         warmup_ratio = float(cfg.optimizer.warmup_ratio)
         if not 0.0 < warmup_ratio <= 1.0:
             raise ValueError(f"AMUSE warmup_ratio must be in (0, 1], got {warmup_ratio}")
+        correspondence_output_lr = cfg.optimizer.get("correspondence_output_lr")
+        if correspondence_output_lr is not None and (
+            isinstance(correspondence_output_lr, bool)
+            or not isinstance(correspondence_output_lr, (int, float))
+            or not math.isfinite(float(correspondence_output_lr))
+            or float(correspondence_output_lr) <= 0
+        ):
+            raise ValueError("AMUSE correspondence_output_lr must be a finite positive number or null")
     elif optimizer_name == "adamw":
         if scheduler not in {"none", "constant", "cosine"}:
             raise ValueError(f"unsupported AdamW scheduler: {scheduler!r}")

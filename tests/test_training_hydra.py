@@ -185,6 +185,27 @@ def test_gpa_correspondence_curriculum_profile_has_six_guarded_stages() -> None:
     }
 
 
+def test_full_joint_pixel_profile_updates_every_head_and_ranks_flow_epe() -> None:
+    cfg = _compose(
+        "data=colmap_rgbd_640x480_fixed4",
+        "model=omega_1b_640x480_near_head",
+        "pixel_depth=pixel_perfect_full_joint_640x480",
+        "checkpoint=topk_correspondence",
+        "trainer=finetune",
+        "trainer.epochs=6",
+    )
+
+    validate_training_config(cfg)
+
+    stages = cfg.pixel_depth.self_supervised.curriculum
+    assert cfg.checkpoint.monitor == "val/correspondence_epe_px"
+    assert all(stage.train_enabled for stage in stages[1:])
+    assert all(stage.train_base_heads for stage in stages[1:])
+    assert all(stage.train_refiner for stage in stages[1:])
+    assert all(stage.train_correspondence for stage in stages[1:])
+    assert all(stage.correspondence_weight > 0 for stage in stages[1:])
+
+
 def test_gpa_anchor_count_cannot_exceed_guaranteed_frame_count() -> None:
     cfg = _compose(
         "pixel_depth=pixel_perfect_gpa_correspondence",

@@ -7,7 +7,7 @@ import torch
 
 from vggt_omega.training.checkpointing import load_resume_checkpoint, save_resume_checkpoint
 from vggt_omega.training.model_factory import PreparedTrainingModel, attach_pixel_depth_model
-from vggt_omega.training.optimizer_factory import classify_amuse_parameters
+from vggt_omega.training.optimizer_factory import build_amuse_optimizer, classify_amuse_parameters
 from vggt_omega.training.pixel_depth_model import BoundedResidualGate, PixelPerfectDepthTrainingModel
 from vggt_omega.training.runner import (
     _load_trainable_state,
@@ -223,10 +223,16 @@ def test_optional_correspondence_head_outputs_directed_pairs_and_obeys_stage_fre
     )
 
     assert result["correspondence_flow_pixels"].shape == (1, 2, 16, 24, 2)
+    assert result["correspondence_geometric_flow_pixels"].shape == (1, 2, 16, 24, 2)
+    assert result["correspondence_residual_flow_pixels"].shape == (1, 2, 16, 24, 2)
     torch.testing.assert_close(
         result["correspondence_flow_pixels"], torch.zeros_like(result["correspondence_flow_pixels"])
     )
     torch.testing.assert_close(result["correspondence_pair_indices"], torch.tensor([[[0, 1], [1, 0]]]))
+
+    result["correspondence_flow_pixels"].sum().backward()
+    assert model.base_model.scale.grad is None
+    model.zero_grad(set_to_none=True)
 
     model.set_curriculum_trainable(train_refiner=False, train_correspondence=True)
     assert not any(
@@ -249,6 +255,14 @@ def test_optional_correspondence_head_outputs_directed_pairs_and_obeys_stage_fre
     )
     assert "correspondence_flow_pixels" not in inactive
     assert "correspondence_pair_indices" not in inactive
+
+    forced_validation = model.forward_refine(
+        images,
+        generator=torch.Generator().manual_seed(99),
+        include_correspondence=True,
+    )
+    assert forced_validation["correspondence_flow_pixels"].shape == (1, 2, 16, 24, 2)
+    assert forced_validation["correspondence_pair_indices"].shape == (1, 2, 2)
 
 
 def test_zero_weight_self_supervision_skips_auxiliary_computation() -> None:
@@ -327,6 +341,22 @@ def test_correspondence_head_is_in_exact_checkpoint_and_amuse_groups() -> None:
     assert any(name.startswith("correspondence_head.") for name in wrapped.trainable_parameter_names)
     assert grouping.fallback_names.count("correspondence_head.output_projection.weight") == 1
     assert set(grouping.muon_names) | set(grouping.fallback_names) == set(wrapped.trainable_parameter_names)
+
+    optimizer = build_amuse_optimizer(
+        wrapped.model,
+        total_optimizer_steps=20,
+        correspondence_output_lr=5e-4,
+    ).optimizer
+    assert [group["group_name"] for group in optimizer.param_groups] == [
+        "muon",
+        "fallback",
+        "correspondence_output",
+    ]
+    assert optimizer.param_groups[2]["lr"] == pytest.approx(5e-4)
+    assert optimizer.param_groups[2]["param_names"] == [
+        "correspondence_head.output_projection.bias",
+        "correspondence_head.output_projection.weight",
+    ]
 
 
 def test_runner_updates_pixel_depth_wrapper_and_reports_flow_metrics() -> None:

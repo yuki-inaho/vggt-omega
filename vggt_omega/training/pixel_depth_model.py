@@ -7,7 +7,7 @@ import math
 import torch
 from torch import nn
 
-from vggt_omega.training.correspondence import FactoredCorrespondenceHead
+from vggt_omega.training.correspondence import FactoredCorrespondenceHead, project_depth_correspondence_flow
 from vggt_omega.training.multiframe import TemporalSemanticMixer, build_warped_neighbor_condition
 from vggt_omega.training.pixel_depth import (
     PixelDepthFlowRefiner,
@@ -212,6 +212,7 @@ class PixelPerfectDepthTrainingModel(nn.Module):
         dynamic_mask: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
         normalization_scale_m: torch.Tensor | None = None,
+        include_correspondence: bool | None = None,
     ) -> dict[str, torch.Tensor]:
         base, prompt, prompt_mask, geometry = self._prepare_context(
             images,
@@ -239,7 +240,13 @@ class PixelPerfectDepthTrainingModel(nn.Module):
         result["base_depth"] = base["depth"]
         result["depth"] = refined_depth[..., None]
         result["residual_gate"] = residual_gate
-        self._add_correspondence_outputs(result, base, images, frame_mask)
+        self._add_correspondence_outputs(
+            result,
+            base,
+            images,
+            frame_mask,
+            active_override=include_correspondence,
+        )
         return result
 
     def prepare_dynamic_context(
@@ -337,8 +344,11 @@ class PixelPerfectDepthTrainingModel(nn.Module):
         base: dict[str, torch.Tensor],
         images: torch.Tensor,
         frame_mask: torch.Tensor | None,
+        *,
+        active_override: bool | None = None,
     ) -> None:
-        if self.correspondence_head is None or not self.correspondence_active:
+        active = self.correspondence_active if active_override is None else active_override
+        if self.correspondence_head is None or not active:
             return
         batch_size, frame_count, _, height, width = images.shape
         if frame_mask is not None and not bool(frame_mask.all()):
@@ -353,14 +363,29 @@ class PixelPerfectDepthTrainingModel(nn.Module):
         pair_indices = pairs[None].expand(batch_size, -1, -1)
         source_grid_value = base["patch_grid_hw"]
         source_grid = (int(source_grid_value[0]), int(source_grid_value[1]))
-        result["correspondence_flow_pixels"] = self.correspondence_head(
-            base["patch_features"],
-            base["pose_enc"],
+        residual_flow = self.correspondence_head(
+            base["patch_features"].detach(),
+            base["pose_enc"].detach(),
             pair_indices,
             source_grid_hw=source_grid,
             output_hw=(height, width),
             pair_chunk_size=self.correspondence_pair_chunk_size,
         )
+        predicted_extrinsics, predicted_intrinsics = encoding_to_camera(
+            base["pose_enc"].float(),
+            (height, width),
+            build_intrinsics=True,
+        )
+        assert predicted_intrinsics is not None
+        geometric_flow = project_depth_correspondence_flow(
+            _base_depth(base).float(),
+            predicted_intrinsics.float(),
+            predicted_extrinsics.float(),
+            pair_indices,
+        ).detach()
+        result["correspondence_residual_flow_pixels"] = residual_flow
+        result["correspondence_geometric_flow_pixels"] = geometric_flow
+        result["correspondence_flow_pixels"] = geometric_flow + residual_flow.float()
         result["correspondence_pair_indices"] = pair_indices
 
     def _prepare_context(

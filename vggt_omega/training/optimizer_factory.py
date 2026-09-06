@@ -212,6 +212,7 @@ def build_amuse_optimizer(
     total_optimizer_steps: int,
     muon_lr: float = 1e-4,
     aux_lr: float = 1e-5,
+    correspondence_output_lr: float | None = None,
     aux_update_type: str = "adamw",
     beta1: float = 0.4,
     beta2: float = 0.999,
@@ -262,10 +263,28 @@ def build_amuse_optimizer(
         ("weight_decay_at_y", weight_decay_at_y, {"nonnegative": True}),
     ):
         _validate_finite(name, float(value), **options)
+    if correspondence_output_lr is not None:
+        _validate_finite("correspondence_output_lr", float(correspondence_output_lr), positive=True)
 
     grouping = classify_amuse_parameters(model)
     named_parameters = _named_parameters(model)
     warmup_steps = max(1, math.ceil(total_optimizer_steps * warmup_ratio))
+    correspondence_output_names = tuple(
+        name
+        for name in grouping.fallback_names
+        if name.endswith(
+            (
+                "correspondence_head.output_projection.weight",
+                "correspondence_head.output_projection.bias",
+            )
+        )
+    )
+    if correspondence_output_lr is not None and not correspondence_output_names:
+        raise ValueError("correspondence_output_lr requires a trainable correspondence output projection")
+    fallback_names = tuple(name for name in grouping.fallback_names if name not in correspondence_output_names)
+    if correspondence_output_lr is None:
+        fallback_names = grouping.fallback_names
+        correspondence_output_names = ()
     parameter_groups = [
         {
             "params": [named_parameters[name] for name in grouping.muon_names],
@@ -278,8 +297,8 @@ def build_amuse_optimizer(
             "weight_decay": weight_decay,
         },
         {
-            "params": [named_parameters[name] for name in grouping.fallback_names],
-            "param_names": list(grouping.fallback_names),
+            "params": [named_parameters[name] for name in fallback_names],
+            "param_names": list(fallback_names),
             "group_name": "fallback",
             "use_muon": False,
             "update_type": aux_update_type,
@@ -289,6 +308,20 @@ def build_amuse_optimizer(
             "weight_decay": weight_decay,
         },
     ]
+    if correspondence_output_names:
+        parameter_groups.append(
+            {
+                "params": [named_parameters[name] for name in correspondence_output_names],
+                "param_names": list(correspondence_output_names),
+                "group_name": "correspondence_output",
+                "use_muon": False,
+                "update_type": aux_update_type,
+                "lr": float(correspondence_output_lr),
+                "beta2": beta2,
+                "eps": 1e-10,
+                "weight_decay": weight_decay,
+            }
+        )
     optimizer = AMUSE(
         parameter_groups,
         weight_decay_at_y=weight_decay_at_y,
@@ -298,12 +331,24 @@ def build_amuse_optimizer(
         rho=rho,
         r=r,
     )
+    group_fingerprint = grouping.fingerprint
+    if correspondence_output_names:
+        group_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "base_partition": grouping.fingerprint,
+                    "correspondence_output": list(correspondence_output_names),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
     return OptimizerBuildResult(
         optimizer=optimizer,
         scheduler=None,
         grouping=grouping,
         warmup_steps=warmup_steps,
-        group_fingerprint=grouping.fingerprint,
+        group_fingerprint=group_fingerprint,
     )
 
 

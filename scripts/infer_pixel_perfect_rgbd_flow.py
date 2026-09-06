@@ -14,6 +14,7 @@ from typing import Any, cast
 import cv2
 import numpy as np
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from reconstruct_rgbd_video import (
     _chunk_windows,
@@ -89,7 +90,49 @@ def _load_trained_model(
         "kind": str(payload["kind"]),
         "sha256": _sha256(checkpoint),
     }
+    training_state = payload.get("training_state")
+    latest_validation = training_state.get("latest_validation") if isinstance(training_state, Mapping) else None
+    if isinstance(latest_validation, Mapping):
+        checkpoint_info["validation"] = {
+            name: float(latest_validation[name])
+            for name in (
+                "correspondence_epe_px",
+                "camera_translation",
+                "near_depth_mae_m",
+                "depth_all_mae_m",
+                "objective",
+            )
+            if name in latest_validation
+        }
     return prepared.model, config, checkpoint_info
+
+
+def _checkpoint_validation_from_tensorboard(
+    run_dir: Path,
+    *,
+    global_step: int,
+) -> dict[str, float]:
+    accumulator = EventAccumulator(
+        str(run_dir / "tensorboard"),
+        size_guidance={"scalars": 0},
+    )
+    accumulator.Reload()
+    available = set(accumulator.Tags().get("scalars", []))
+    result: dict[str, float] = {}
+    for name in (
+        "correspondence_epe_px",
+        "camera_translation",
+        "near_depth_mae_m",
+        "depth_all_mae_m",
+        "objective",
+    ):
+        tag = f"val/{name}"
+        if tag not in available:
+            continue
+        matches = [event for event in accumulator.Scalars(tag) if event.step == global_step]
+        if matches:
+            result[name] = float(matches[-1].value)
+    return result
 
 
 def _source_to_target_pair(prediction: Mapping[str, torch.Tensor]) -> tuple[int, torch.Tensor]:
@@ -171,12 +214,15 @@ def main() -> int:
     refined_depth_frames: list[np.ndarray] = []
     measured_depth_frames: list[np.ndarray] = []
     predicted_flow_frames: list[np.ndarray] = []
+    geometric_flow_frames: list[np.ndarray] = []
+    residual_flow_frames: list[np.ndarray] = []
     teacher_flow_frames: list[np.ndarray] = []
     teacher_masks: list[np.ndarray] = []
     frame_pairs: list[list[int]] = []
     base_scales: list[float] = []
     refined_scales: list[float] = []
     epe_sum = 0.0
+    geometric_epe_sum = 0.0
     epe_pixels = 0
     generator = torch.Generator(device=device).manual_seed(args.seed)
     started_at = time.perf_counter()
@@ -208,6 +254,8 @@ def main() -> int:
         base_scale, _ = _metric_scale(base_depth, metric_depth)
         refined_scale, _ = _metric_scale(refined_depth, metric_depth)
         predicted_flow = prediction["correspondence_flow_pixels"][0, pair_offset].float().cpu().numpy()
+        geometric_flow = prediction["correspondence_geometric_flow_pixels"][0, pair_offset].float().cpu().numpy()
+        residual_flow = prediction["correspondence_residual_flow_pixels"][0, pair_offset].float().cpu().numpy()
 
         frame_positions = [int(np.flatnonzero(arrays["frame_ids"] == int(frame_id))[0]) for frame_id in frame_ids]
         intrinsics = torch.from_numpy(arrays["intrinsics"][frame_positions]).unsqueeze(0).to(device)
@@ -227,7 +275,9 @@ def main() -> int:
         finite_mask = teacher_mask & np.isfinite(predicted_flow).all(axis=-1) & np.isfinite(teacher_flow).all(axis=-1)
         if finite_mask.any():
             error = np.linalg.norm(predicted_flow[finite_mask] - teacher_flow[finite_mask], axis=-1)
+            geometric_error = np.linalg.norm(geometric_flow[finite_mask] - teacher_flow[finite_mask], axis=-1)
             epe_sum += float(error.sum(dtype=np.float64))
+            geometric_epe_sum += float(geometric_error.sum(dtype=np.float64))
             epe_pixels += int(error.size)
 
         source_rgb_frames.append(cv2.resize(rgb_array[0], (args.video_width, args.video_height), cv2.INTER_AREA))
@@ -241,6 +291,8 @@ def main() -> int:
             cv2.resize(metric_depth[0], (args.video_width, args.video_height), cv2.INTER_NEAREST)
         )
         predicted_flow_frames.append(_flow_resize(predicted_flow, args.video_width, args.video_height))
+        geometric_flow_frames.append(_flow_resize(geometric_flow, args.video_width, args.video_height))
+        residual_flow_frames.append(_flow_resize(residual_flow, args.video_width, args.video_height))
         teacher_flow_frames.append(_flow_resize(teacher_flow, args.video_width, args.video_height))
         teacher_masks.append(_mask_resize(teacher_mask, args.video_width, args.video_height))
         frame_pairs.append([int(frame_ids[0]), int(frame_ids[1])])
@@ -258,11 +310,14 @@ def main() -> int:
     refined_depth_array = np.stack(refined_depth_frames).astype(np.float32)
     measured_depth_array = np.stack(measured_depth_frames).astype(np.float32)
     predicted_flow_array = np.stack(predicted_flow_frames).astype(np.float32)
+    geometric_flow_array = np.stack(geometric_flow_frames).astype(np.float32)
+    residual_flow_array = np.stack(residual_flow_frames).astype(np.float32)
     teacher_flow_array = np.stack(teacher_flow_frames).astype(np.float32)
     teacher_mask_array = np.stack(teacher_masks)
     flow_magnitudes = np.concatenate(
         (
             np.linalg.norm(predicted_flow_array, axis=-1).reshape(-1),
+            np.linalg.norm(geometric_flow_array, axis=-1).reshape(-1),
             np.linalg.norm(teacher_flow_array[teacher_mask_array], axis=-1),
         )
     )
@@ -277,13 +332,13 @@ def main() -> int:
     )
     flow_writer = _open_writer(
         output_dir / "pixel_perfect_flow.mp4",
-        args.video_width * 3,
+        args.video_width * 4,
         args.video_height,
         args.video_fps,
     )
     combined_writer = _open_writer(
         output_dir / "pixel_perfect_rgbd_flow.mp4",
-        args.video_width * 6,
+        args.video_width * 7,
         args.video_height,
         args.video_fps,
     )
@@ -294,15 +349,16 @@ def main() -> int:
             base_depth = _label(_depth_color(base_depth_array[index]), "VGGT base depth [m]")
             refined_depth = _label(_depth_color(refined_depth_array[index]), "Pixel-Perfect depth [m]")
             measured_depth = _label(_depth_color(measured_depth_array[index]), "RGB-D measured depth [m]")
-            learned_flow = _label(_flow_color(predicted_flow_array[index], flow_scale), "learned flow 0->1")
+            geometric_flow = _label(_flow_color(geometric_flow_array[index], flow_scale), "geometry flow 0->1")
+            learned_flow = _label(_flow_color(predicted_flow_array[index], flow_scale), "learned total flow 0->1")
             teacher_flow = _label(
                 _flow_color(teacher_flow_array[index], flow_scale, teacher_mask_array[index]),
                 "RGB-D teacher flow 0->1",
             )
             rgbd_writer.write(np.concatenate((rgb, base_depth, refined_depth, measured_depth), axis=1))
-            flow_writer.write(np.concatenate((rgb, learned_flow, teacher_flow), axis=1))
+            flow_writer.write(np.concatenate((rgb, geometric_flow, learned_flow, teacher_flow), axis=1))
             combined = np.concatenate(
-                (rgb, base_depth, refined_depth, measured_depth, learned_flow, teacher_flow),
+                (rgb, base_depth, refined_depth, measured_depth, geometric_flow, learned_flow, teacher_flow),
                 axis=1,
             )
             combined_writer.write(combined)
@@ -322,10 +378,31 @@ def main() -> int:
         refined_depth_m=refined_depth_array.astype(np.float16),
         measured_depth_m=measured_depth_array.astype(np.float16),
         predicted_flow_xy=np.clip(predicted_flow_array, -65504, 65504).astype(np.float16),
+        geometric_flow_xy=np.clip(geometric_flow_array, -65504, 65504).astype(np.float16),
+        learned_residual_flow_xy=np.clip(residual_flow_array, -65504, 65504).astype(np.float16),
         rgbd_teacher_flow_xy=np.clip(teacher_flow_array, -65504, 65504).astype(np.float16),
         rgbd_teacher_covisibility=teacher_mask_array.astype(np.uint8),
     )
     run_summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    checkpoint_validation = checkpoint_info.get("validation", {})
+    if not isinstance(checkpoint_validation, Mapping):
+        checkpoint_validation = {}
+    validation_source = "checkpoint_training_state"
+    if not checkpoint_validation:
+        checkpoint_validation = _checkpoint_validation_from_tensorboard(
+            run_dir,
+            global_step=int(checkpoint_info["global_step"]),
+        )
+        validation_source = "tensorboard_at_checkpoint_step"
+    fallback_validation = cast(Mapping[str, Any], run_summary["validation"])
+    if not checkpoint_validation:
+        validation_source = "final_run_summary_fallback"
+
+    def validation_metric(name: str) -> float:
+        return float(checkpoint_validation.get(name, fallback_validation[name]))
+
+    learned_epe = epe_sum / max(epe_pixels, 1)
+    geometric_epe = geometric_epe_sum / max(epe_pixels, 1)
     summary = {
         "status": "passed",
         "format_version": 1,
@@ -346,14 +423,23 @@ def main() -> int:
             "visualization_p99_scale_px_at_saved_grid": flow_scale,
             "predicted_finite_fraction": float(np.isfinite(predicted_flow_array).mean()),
             "teacher_covisibility_fraction": float(teacher_mask_array.mean()),
-            "rgbd_teacher_epe_px_at_model_grid": epe_sum / max(epe_pixels, 1),
+            "rgbd_teacher_epe_px_at_model_grid": learned_epe,
+            "geometric_rgbd_teacher_epe_px_at_model_grid": geometric_epe,
+            "learned_epe_improvement_px": geometric_epe - learned_epe,
+            "learned_epe_improvement_fraction": (
+                (geometric_epe - learned_epe) / geometric_epe if geometric_epe > 0 else 0.0
+            ),
             "rgbd_teacher_epe_pixel_count": epe_pixels,
         },
         "training_validation": {
-            "near_depth_mae_m": float(run_summary["validation"]["near_depth_mae_m"]),
-            "all_depth_mae_m": float(run_summary["validation"]["depth_all_mae_m"]),
+            "source": validation_source,
+            "near_depth_mae_m": validation_metric("near_depth_mae_m"),
+            "all_depth_mae_m": validation_metric("depth_all_mae_m"),
+            "camera_translation": validation_metric("camera_translation"),
+            "correspondence_epe_px": validation_metric("correspondence_epe_px"),
+            "objective": validation_metric("objective"),
             "max_cuda_memory_gib": float(run_summary["max_cuda_memory_gib"]),
-            "global_step": int(run_summary["global_step"]),
+            "global_step": int(checkpoint_info["global_step"]),
         },
         "outputs": {
             "rgbd_video": "pixel_perfect_rgbd.mp4",

@@ -1,0 +1,6 @@
+name: topk_correspondence
+k: 3
+monitor: val/correspondence_epe_px
+mode: min
+save_last: true
+directory: checkpoints

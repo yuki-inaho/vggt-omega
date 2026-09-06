@@ -291,6 +291,7 @@ def _training_scalars(
         "gpa_smoothness": "train/gpa_smoothness",
         "gpa_valid_fraction": "train/gpa_valid_fraction",
         "correspondence_objective": "train/correspondence_objective",
+        "correspondence_epe_px": "train/correspondence_epe_px",
         "correspondence_covisibility": "train/correspondence_covisibility",
         "correspondence_pair_count": "train/correspondence_pair_count",
         "dynamic_objective": "train/dynamic_objective",
@@ -326,7 +327,7 @@ def _training_scalars(
     for metric_name, tag in optional_metrics.items():
         if metric_name in losses:
             scalars[tag] = float(losses[metric_name].detach())
-    for index, group in enumerate(optimizer.param_groups[:2]):
+    for index, group in enumerate(optimizer.param_groups):
         scalars[f"optimizer/group_{index}_lr"] = float(group["lr"])
     beta1 = _optimizer_beta1(optimizer)
     if beta1 is not None:
@@ -767,6 +768,10 @@ def validate_one_epoch(
                     dynamic_mask=batch.get("dynamic_masks"),
                     frame_mask=batch.get("frame_mask"),
                     normalization_scale_m=batch.get("normalization_scale_m"),
+                    include_correspondence=bool(
+                        isinstance(pixel_depth_options.get("correspondence"), Mapping)
+                        and cast(Mapping[str, object], pixel_depth_options["correspondence"]).get("enabled", False)
+                    ),
                 )
             losses = compute_camera_depth_loss(
                 predictions,
@@ -796,6 +801,7 @@ def validate_one_epoch(
                             batch,
                             pixel_depth_options,
                             generator=flow_generator,
+                            evaluate_inactive=True,
                         )
                     )
                 losses = pixel_metrics
@@ -1131,9 +1137,11 @@ def _self_supervised_losses(
     options: Mapping[str, object],
     *,
     generator: torch.Generator,
+    evaluate_inactive: bool = False,
 ) -> dict[str, torch.Tensor]:
     from vggt_omega.training.correspondence import (
         build_rgbd_correspondence_targets,
+        masked_endpoint_error,
         masked_generalized_charbonnier,
     )
     from vggt_omega.training.gpa_loss import gpa_sequence_loss, sample_gpa_anchor_indices
@@ -1143,10 +1151,12 @@ def _self_supervised_losses(
     correspondence_options = options.get("correspondence")
     if not isinstance(gpa_options, Mapping) or not isinstance(correspondence_options, Mapping):
         return {}
-    gpa_active = bool(gpa_options.get("enabled", False)) and float(gpa_options.get("objective_weight", 0.0)) > 0
+    gpa_active = bool(gpa_options.get("enabled", False)) and (
+        evaluate_inactive or float(gpa_options.get("objective_weight", 0.0)) > 0
+    )
     correspondence_active = (
         bool(correspondence_options.get("enabled", False))
-        and float(correspondence_options.get("objective_weight", 0.0)) > 0
+        and (evaluate_inactive or float(correspondence_options.get("objective_weight", 0.0)) > 0)
     )
     if not gpa_active and not correspondence_active:
         return {}
@@ -1233,9 +1243,15 @@ def _self_supervised_losses(
             alpha=float(correspondence_options["alpha"]),
             epsilon=float(correspondence_options["epsilon"]),
         )
+        correspondence_epe = masked_endpoint_error(
+            predicted_flow.float(),
+            targets["flow_pixels"],
+            targets["covisibility_mask"],
+        )
         losses.update(
             {
                 "correspondence_objective": correspondence,
+                "correspondence_epe_px": correspondence_epe,
                 "correspondence_covisibility": targets["covisibility_mask"].float().mean(),
                 "correspondence_pair_count": predicted_flow.new_tensor(float(pair_indices.shape[1])),
             }
@@ -1732,6 +1748,11 @@ def _build_optimizer_from_config(
             total_optimizer_steps=total_optimizer_steps,
             muon_lr=float(cfg.optimizer.muon_lr),
             aux_lr=float(cfg.optimizer.aux_lr),
+            correspondence_output_lr=(
+                None
+                if cfg.optimizer.get("correspondence_output_lr") is None
+                else float(cfg.optimizer.correspondence_output_lr)
+            ),
             aux_update_type=str(cfg.optimizer.aux_update_type),
             beta1=float(cfg.optimizer.beta1),
             beta2=float(cfg.optimizer.beta2),
